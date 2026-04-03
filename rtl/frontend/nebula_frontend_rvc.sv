@@ -401,18 +401,31 @@ module nebula_frontend_rvc #(
         end
     end
 
+    // Controle de Latch de retenção
+    logic flush_pending;
+    logic [VADDR_WIDTH-1:0] flush_pc_latched;
+
     // Sequential
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state              <= S_RESET;
             pc_reg             <= RESET_VECTOR;
+            flush_pc_latched   <= RESET_VECTOR;
             fetch_buffer       <= '0;
             fetch_buffer_valid <= '0;  // agora 5 bits
             fetch_offset       <= '0;
             cached_ppn         <= '0;
             tlb_done           <= 1'b0;
+            flush_pending      <= 1'b0; 
         end else begin
             state <= next_state;
+
+            if (backend_redirect) begin
+                flush_pending    <= 1'b1;
+                flush_pc_latched <= backend_redirect_pc;
+            end else if (state == S_FLUSH) begin
+                flush_pending    <= 1'b0;
+            end
             case (state)
                 S_RESET: begin
                     pc_reg             <= RESET_VECTOR;
@@ -434,12 +447,11 @@ module nebula_frontend_rvc #(
 
                 S_ICACHE_WAIT: begin
                     if (icache_resp_valid && !icache_resp_error) begin
-                        // Se offset[2] estava setado (linha anterior cruzou),
+                        // Se offset[2] estava setado,
                         // preserva [79:64] como o halfword extra da linha anterior
                         if (fetch_offset[2])
                             fetch_buffer[79:64] <= fetch_buffer[63:48];
                         fetch_buffer[63:0]  <= icache_resp_data;
-                        // FIX 3: setar todos os 4 bits válidos + bit[4] se offset[2]
                         fetch_buffer_valid <= fetch_offset[2] ? 5'b1_1111 : 5'b0_1111;
                     end
                 end
@@ -468,7 +480,11 @@ module nebula_frontend_rvc #(
                 end
 
                 S_FLUSH: begin
-                    if (backend_redirect) pc_reg <= backend_redirect_pc;
+                    if (backend_redirect) 
+                        pc_reg <= backend_redirect_pc;
+                    else if (flush_pending) 
+                        pc_reg <= flush_pc_latched;
+                    
                     fetch_buffer       <= '0;
                     fetch_buffer_valid <= '0;
                     fetch_offset       <= '0;

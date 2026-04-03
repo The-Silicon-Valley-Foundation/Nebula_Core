@@ -166,10 +166,10 @@ module nebula_backend_fpu #(
     logic [XLEN-1:0] exec_trap_value;
 
     // Memory stage
-    logic [XLEN-1:0] mem_result;
+    logic [XLEN-1:0] mem0_result, mem1_result;
+    logic [4:0]      mem0_rd, mem1_rd;
+    logic            mem0_int_we, mem1_int_we;
     logic [FLEN-1:0] mem_fp_result;
-    logic [4:0]      mem_rd;
-    logic            mem_int_we;
     logic            mem_fp_we;
 
     // =========================================================================
@@ -203,28 +203,32 @@ module nebula_backend_fpu #(
 
     always_comb begin
         if (frontend_in.instr0.rs1 == 5'd0) rs1_0_fwd = 64'd0;
-        else if (mem_int_we && mem_rd == frontend_in.instr0.rs1) rs1_0_fwd = mem_result;
+        else if (mem1_int_we && mem1_rd == frontend_in.instr0.rs1) rs1_0_fwd = mem1_result;
+        else if (mem0_int_we && mem0_rd == frontend_in.instr0.rs1) rs1_0_fwd = mem0_result;
         else rs1_0_fwd = regfile[frontend_in.instr0.rs1];
 
         if (frontend_in.instr0.rs2 == 5'd0) rs2_0_fwd = 64'd0;
-        else if (mem_int_we && mem_rd == frontend_in.instr0.rs2) rs2_0_fwd = mem_result;
+        else if (mem1_int_we && mem1_rd == frontend_in.instr0.rs2) rs2_0_fwd = mem1_result;
+        else if (mem0_int_we && mem0_rd == frontend_in.instr0.rs2) rs2_0_fwd = mem0_result;
         else rs2_0_fwd = regfile[frontend_in.instr0.rs2];
 
         if (frontend_in.instr1.rs1 == 5'd0) rs1_1_fwd = 64'd0;
-        else if (mem_int_we && mem_rd == frontend_in.instr1.rs1) rs1_1_fwd = mem_result;
+        else if (mem1_int_we && mem1_rd == frontend_in.instr1.rs1) rs1_1_fwd = mem1_result;
+        else if (mem0_int_we && mem0_rd == frontend_in.instr1.rs1) rs1_0_fwd = mem0_result;
         else rs1_1_fwd = regfile[frontend_in.instr1.rs1];
 
         if (frontend_in.instr1.rs2 == 5'd0) rs2_1_fwd = 64'd0;
-        else if (mem_int_we && mem_rd == frontend_in.instr1.rs2) rs2_1_fwd = mem_result;
+        else if (mem1_int_we && mem1_rd == frontend_in.instr1.rs2) rs2_1_fwd = mem1_result;
+        else if (mem0_int_we && mem0_rd == frontend_in.instr1.rs2) rs2_0_fwd = mem0_result;
         else rs2_1_fwd = regfile[frontend_in.instr1.rs2];
 
-        if (mem_fp_we && mem_rd == frontend_in.instr0.rs1) frs1_forwarded = mem_fp_result;
+        if (mem_fp_we && mem0_rd == frontend_in.instr0.rs1) frs1_forwarded = mem_fp_result;
         else frs1_forwarded = fpregfile[frontend_in.instr0.rs1];
 
-        if (mem_fp_we && mem_rd == frontend_in.instr0.rs2) frs2_forwarded = mem_fp_result;
+        if (mem_fp_we && mem0_rd == frontend_in.instr0.rs2) frs2_forwarded = mem_fp_result;
         else frs2_forwarded = fpregfile[frontend_in.instr0.rs2];
 
-        if (mem_fp_we && mem_rd == frontend_in.instr0.rs3) frs3_forwarded = mem_fp_result;
+        if (mem_fp_we && mem0_rd == frontend_in.instr0.rs3) frs3_forwarded = mem_fp_result;
         else frs3_forwarded = fpregfile[frontend_in.instr0.rs3];
     end
 
@@ -622,10 +626,13 @@ module nebula_backend_fpu #(
             exec_trap          <= 1'b0;
             exec_trap_cause    <= EXC_ILLEGAL_INSTR;
             exec_trap_value    <= '0;
-            mem_result         <= '0;
+            mem0_result        <= '0;
+            mem1_result        <= '0;
             mem_fp_result      <= '0;
-            mem_rd             <= '0;
-            mem_int_we         <= 1'b0;
+            mem0_rd            <= '0;
+            mem1_rd            <= '0;
+            mem0_int_we        <= 1'b0;
+            mem1_int_we        <= 1'b0;
             mem_fp_we          <= 1'b0;
             trap_cause         <= '0;
             trap_value         <= '0;
@@ -643,7 +650,8 @@ module nebula_backend_fpu #(
 
             case (state)
                 S_IDLE: begin
-                    mem_int_we        <= 1'b0;
+                    mem0_int_we       <= 1'b0;
+                    mem1_int_we       <= 1'b0;
                     mem_fp_we         <= 1'b0;
                     exec_trap         <= 1'b0;
                     trap_is_interrupt <= 1'b0;
@@ -807,12 +815,12 @@ module nebula_backend_fpu #(
                             trap_cause <= {58'b0, dcache_we ? 6'(EXC_STORE_ACCESS_FAULT) : 6'(EXC_LOAD_ACCESS_FAULT)};
                             trap_value <= {{(XLEN-VADDR_WIDTH){exec_mem_addr[VADDR_WIDTH-1]}}, exec_mem_addr};
                         end else if (issue_instr0.is_load || (issue_valid1 && issue_instr1.is_load)) begin
-                            mem_result <= sign_extend_load(dcache_resp_data,
+                            mem0_result <= sign_extend_load(dcache_resp_data,
                                           mem_is_instr1 ? issue_instr1.funct3 : issue_instr0.funct3);
                         end else if (issue_instr0.is_fp_load) begin
                             mem_fp_result <= dcache_resp_data;
                         end else if (issue_instr0.is_amo || (issue_valid1 && issue_instr1.is_amo)) begin
-                            mem_result <= dcache_resp_data;
+                            mem0_result <= dcache_resp_data;
                         end
                     end
                 end
@@ -823,21 +831,21 @@ module nebula_backend_fpu #(
                         if (issue_instr0.is_alu || issue_instr0.is_jal || issue_instr0.is_jalr ||
                             issue_instr0.is_csr || issue_instr0.is_mdu) begin
                             regfile[issue_instr0.rd] <= exec_result0;
-                            mem_result <= exec_result0;
-                            mem_rd     <= issue_instr0.rd;
-                            mem_int_we <= 1'b1;
+                            mem0_result <= exec_result0;
+                            mem0_rd     <= issue_instr0.rd;
+                            mem0_int_we <= 1'b1;
                         end else if (!mem_is_instr1 && (issue_instr0.is_load || issue_instr0.is_amo)) begin
-                            regfile[issue_instr0.rd] <= mem_result;
-                            mem_rd     <= issue_instr0.rd;
-                            mem_int_we <= 1'b1;
+                            regfile[issue_instr0.rd] <= mem0_result;
+                            mem0_rd     <= issue_instr0.rd;
+                            mem0_int_we <= 1'b1;
                         end else if (issue_instr0.is_fp &&
                                     (decoded_fpu_op inside {FPU_CMP_EQ, FPU_CMP_LT, FPU_CMP_LE,
                                                             FPU_CVT_W, FPU_CVT_WU, FPU_CVT_L, FPU_CVT_LU,
                                                             FPU_CLASS, FPU_MV_X_W})) begin
                             regfile[issue_instr0.rd] <= exec_result0;
-                            mem_result <= exec_result0;
-                            mem_rd     <= issue_instr0.rd;
-                            mem_int_we <= 1'b1;
+                            mem0_result <= exec_result0;
+                            mem0_rd     <= issue_instr0.rd;
+                            mem0_int_we <= 1'b1;
                         end
                     end
 
@@ -845,20 +853,20 @@ module nebula_backend_fpu #(
                     if (issue_valid1 && issue_instr1.rd != 5'd0) begin
                         if (issue_instr1.is_alu || issue_instr1.is_jal || issue_instr1.is_jalr) begin
                             regfile[issue_instr1.rd] <= exec_result1;
-                            mem_result <= exec_result1;
-                            mem_rd     <= issue_instr1.rd;
-                            mem_int_we <= 1'b1;
+                            mem1_result <= exec_result1;
+                            mem1_rd     <= issue_instr1.rd;
+                            mem1_int_we <= 1'b1;
                         end else if (mem_is_instr1 && (issue_instr1.is_load || issue_instr1.is_amo)) begin
-                            regfile[issue_instr1.rd] <= mem_result;
-                            mem_rd     <= issue_instr1.rd;
-                            mem_int_we <= 1'b1;
+                            regfile[issue_instr1.rd] <= mem1_result;
+                            mem1_rd     <= issue_instr1.rd;
+                            mem1_int_we <= 1'b1;
                         end
                     end
 
                     // FP writeback (instr0 apenas)
                     if (issue_instr0.is_fp_load) begin
                         fpregfile[issue_instr0.rd] <= mem_fp_result;
-                        mem_rd    <= issue_instr0.rd;
+                        mem0_rd    <= issue_instr0.rd;
                         mem_fp_we <= 1'b1;
                     end else if (issue_instr0.is_fp &&
                                 !(decoded_fpu_op inside {FPU_CMP_EQ, FPU_CMP_LT, FPU_CMP_LE,
@@ -866,7 +874,7 @@ module nebula_backend_fpu #(
                                                          FPU_CLASS, FPU_MV_X_W})) begin
                         fpregfile[issue_instr0.rd] <= exec_fp_result;
                         mem_fp_result <= exec_fp_result;
-                        mem_rd        <= issue_instr0.rd;
+                        mem0_rd        <= issue_instr0.rd;
                         mem_fp_we     <= 1'b1;
                     end
                 end

@@ -35,6 +35,8 @@ int main(int argc, char** argv) {
     top->clk = 0;
     top->rst_n = 0;
     top->imem_ack = 0;
+
+    static bool req_latched = false;
     
     // Zera o barramento de memória (512 bits = 16 words de 32 bits)
     for(int i=0; i<16; i++) top->imem_data[i] = 0;
@@ -53,18 +55,26 @@ int main(int argc, char** argv) {
         // Lógica da Memória (Simula o atraso do barramento na subida do clock)
         if (top->clk == 1 && top->rst_n == 1) {
             if (top->imem_req) {
+                req_latched = true;
+            }
+
+            if (req_latched && !top->imem_ack) {
                 if (imem_wait == 0) {
-                    imem_wait = 2; // Simula 2 ciclos de latência
+                    imem_wait = 2; // Simula 2 ciclos de latência da RAM
                 } else {
                     imem_wait--;
                     if (imem_wait == 0) {
                         top->imem_ack = 1;
+                        req_latched = false; // Transação concluída
+                        
+                        // Entrega a linha de cache L1 completa (64 bytes)
                         for(int j=0; j<16; j++) {
                             top->imem_data[j] = INSTRUCTIONS[j];
                         }
                     }
                 }
-            } else {
+            } else if (top->imem_ack) {
+                // Baixa o ACK no ciclo seguinte para evitar leituras duplicadas
                 top->imem_ack = 0;
             }
         }
