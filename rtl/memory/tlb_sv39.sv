@@ -3,56 +3,58 @@
 
 /**
  * @module tlb_sv39
- * @brief TLB (Translation Lookaside Buffer) para Sv39 com suporte completo a permissões
+ * @brief TLB para Sv39
  *
- * @details TLB totalmente associativa com:
- * - Suporte a VPN de 27 bits (Sv39: 3 níveis x 9 bits)
- * - PPN de 44 bits
- * - ASID de 16 bits
- * - Bits de permissão: R, W, X, U, G, A, D
- * - Suporte a superpages (megapages e gigapages)
- * - Invalidação por ASID e por endereço (SFENCE.VMA)
+ * CORREÇÕES APLICADAS:
+ * 1. BUG CRÍTICO — bits A/D: o código anterior setava lookup_page_fault=1
+ *    quando !found_entry.a ou (!d && store), causando loop infinito no boot
+ *    do Linux. O hardware com writeback A/D (ptw_sv39.sv já implementado)
+ *    deve operar assim:
+ *      - Se A/D precisam ser setados → invalida a entrada no TLB (dá miss)
+ *        para que o PTW faça o walk, atualize a PTE na memória e reinserira
+ *        a entrada com A/D corretos.
+ *      - NÃO gera page fault por ausência de A/D — isso era comportamento
+ *        de software-managed A/D, não hardware-managed.
+ *    FIX: quando need_set_a ou need_set_d, lookup_hit=0 (forçar miss),
+ *    e a invalidação ocorre no always_ff.
+ *
+ * 2. access_fault não propaga lookup_page_fault — page_fault é sinalizado
+ *    apenas para violações reais de permissão (R/W/X/U).
  */
 module tlb_sv39 #(
-    parameter int VPN_WIDTH = 27,    // 39 - 12 = 27 bits de VPN
-    parameter int PPN_WIDTH = 44,
+    parameter int VPN_WIDTH  = 27,
+    parameter int PPN_WIDTH  = 44,
     parameter int TLB_ENTRIES = 64,
     parameter int ASID_WIDTH = 16
 )(
     input  wire clk,
     input  wire rst_n,
-    
-    // =========================================================================
-    // Interface de Lookup
-    // =========================================================================
+
+    // Lookup
     input  wire                     lookup_valid,
     input  wire [VPN_WIDTH-1:0]     lookup_vpn,
     input  wire [ASID_WIDTH-1:0]    lookup_asid,
-    input  wire [1:0]               lookup_priv,      // Privilégio atual
-    input  wire                     lookup_is_store,  // Para verificar W
-    input  wire                     lookup_is_exec,   // Para verificar X
-    input  wire                     mstatus_sum,      // Supervisor pode acessar User
-    input  wire                     mstatus_mxr,      // Make eXecutable Readable
-    
+    input  wire [1:0]               lookup_priv,
+    input  wire                     lookup_is_store,
+    input  wire                     lookup_is_exec,
+    input  wire                     mstatus_sum,
+    input  wire                     mstatus_mxr,
+
     output logic                    lookup_hit,
     output logic [PPN_WIDTH-1:0]    lookup_ppn,
     output logic                    lookup_page_fault,
-    output logic                    access_fault,     // Violação de permissão
-    
-    // Bits de página para atualização A/D
-    output logic                    need_set_a,       // Precisa setar bit A
-    output logic                    need_set_d,       // Precisa setar bit D
-    output logic [VPN_WIDTH-1:0]    fault_vpn,        // VPN que causou fault
-    
-    // =========================================================================
-    // Interface de Insert (do PTW)
-    // =========================================================================
+    output logic                    access_fault,
+
+    output logic                    need_set_a,
+    output logic                    need_set_d,
+    output logic [VPN_WIDTH-1:0]    fault_vpn,
+
+    // Insert
     input  wire                     insert_valid,
     input  wire [VPN_WIDTH-1:0]     insert_vpn,
     input  wire [PPN_WIDTH-1:0]     insert_ppn,
     input  wire [ASID_WIDTH-1:0]    insert_asid,
-    input  wire [1:0]               insert_page_size, // 0=4KB, 1=2MB, 2=1GB
-    // Bits de permissão da PTE
+    input  wire [1:0]               insert_page_size,
     input  wire                     insert_r,
     input  wire                     insert_w,
     input  wire                     insert_x,
@@ -60,241 +62,171 @@ module tlb_sv39 #(
     input  wire                     insert_g,
     input  wire                     insert_a,
     input  wire                     insert_d,
-    
-    // =========================================================================
-    // Interface de Invalidação (SFENCE.VMA)
-    // =========================================================================
-    input  wire                     invalidate_all,       // rs1=x0, rs2=x0
-    input  wire                     invalidate_by_asid,   // rs1=x0, rs2!=x0
-    input  wire                     invalidate_by_addr,   // rs1!=x0, rs2=x0
-    input  wire                     invalidate_by_both,   // rs1!=x0, rs2!=x0
+
+    // Invalidate
+    input  wire                     invalidate_all,
+    input  wire                     invalidate_by_asid,
+    input  wire                     invalidate_by_addr,
+    input  wire                     invalidate_by_both,
     input  wire [ASID_WIDTH-1:0]    invalidate_asid,
     input  wire [VPN_WIDTH-1:0]     invalidate_vpn
 );
 
-    // Privilege levels
     localparam PRIV_U = 2'b00;
     localparam PRIV_S = 2'b01;
     localparam PRIV_M = 2'b11;
 
-    // Estrutura de entrada TLB
     typedef struct packed {
         logic                   valid;
         logic [VPN_WIDTH-1:0]   vpn;
         logic [PPN_WIDTH-1:0]   ppn;
         logic [ASID_WIDTH-1:0]  asid;
-        logic [1:0]             page_size;  // 0=4KB, 1=2MB (megapage), 2=1GB (gigapage)
-        // Bits de permissão
-        logic                   r;          // Readable
-        logic                   w;          // Writable
-        logic                   x;          // Executable
-        logic                   u;          // User-mode accessible
-        logic                   g;          // Global (ignora ASID)
-        logic                   a;          // Accessed
-        logic                   d;          // Dirty
+        logic [1:0]             page_size;
+        logic                   r, w, x, u, g, a, d;
     } tlb_entry_t;
 
     tlb_entry_t entries [0:TLB_ENTRIES-1];
-    
-    // Ponteiro de substituição (pseudo-LRU simplificado como round-robin)
     logic [$clog2(TLB_ENTRIES)-1:0] replace_ptr;
-    
-    // Máscara de VPN baseada no tamanho da página
-    // Sv39: VPN[2] = bits 26:18, VPN[1] = bits 17:9, VPN[0] = bits 8:0
+
     function automatic logic vpn_match(
-        input [VPN_WIDTH-1:0] vpn1,
-        input [VPN_WIDTH-1:0] vpn2,
-        input [1:0] page_size
+        input [VPN_WIDTH-1:0] v1, v2,
+        input [1:0] ps
     );
-        case (page_size)
-            2'b00: // 4KB - compara todos os 27 bits
-                return (vpn1 == vpn2);
-            2'b01: // 2MB (megapage) - ignora VPN[0] (9 bits)
-                return (vpn1[VPN_WIDTH-1:9] == vpn2[VPN_WIDTH-1:9]);
-            2'b10: // 1GB (gigapage) - ignora VPN[0] e VPN[1] (18 bits)
-                return (vpn1[VPN_WIDTH-1:18] == vpn2[VPN_WIDTH-1:18]);
-            default:
-                return (vpn1 == vpn2);
+        case (ps)
+            2'b00: return (v1 == v2);
+            2'b01: return (v1[VPN_WIDTH-1:9] == v2[VPN_WIDTH-1:9]);
+            2'b10: return (v1[VPN_WIDTH-1:18] == v2[VPN_WIDTH-1:18]);
+            default: return (v1 == v2);
         endcase
     endfunction
-    
-    // Construir PPN final para superpages
+
     function automatic [PPN_WIDTH-1:0] build_ppn(
-        input [PPN_WIDTH-1:0] entry_ppn,
+        input [PPN_WIDTH-1:0] ep,
         input [VPN_WIDTH-1:0] vpn,
-        input [1:0] page_size
+        input [1:0] ps
     );
-        case (page_size)
-            2'b00: // 4KB
-                return entry_ppn;
-            2'b01: // 2MB - PPN[8:0] vem do VPN[0]
-                return {entry_ppn[PPN_WIDTH-1:9], vpn[8:0]};
-            2'b10: // 1GB - PPN[17:0] vem do VPN[1:0]
-                return {entry_ppn[PPN_WIDTH-1:18], vpn[17:0]};
-            default:
-                return entry_ppn;
+        case (ps)
+            2'b00: return ep;
+            2'b01: return {ep[PPN_WIDTH-1:9],  vpn[8:0]};
+            2'b10: return {ep[PPN_WIDTH-1:18], vpn[17:0]};
+            default: return ep;
         endcase
     endfunction
 
     // =========================================================================
-    // Lógica de Lookup (Combinacional)
+    // Lookup (combinacional)
     // =========================================================================
-    
-    logic found;
+    logic                          found;
     logic [$clog2(TLB_ENTRIES)-1:0] found_idx;
-    tlb_entry_t found_entry;
-    logic perm_ok;
-    logic need_a_update, need_d_update;
-    
+    tlb_entry_t                    found_entry;
+
+    // Sinal para invalidar entrada com A/D desatualizado (registrado)
+    logic                          need_invalidate;
+    logic [$clog2(TLB_ENTRIES)-1:0] invalidate_idx;
+
     always_comb begin
-        lookup_hit = 1'b0;
-        lookup_ppn = '0;
+        lookup_hit        = 1'b0;
+        lookup_ppn        = '0;
         lookup_page_fault = 1'b0;
-        access_fault = 1'b0;
-        need_set_a = 1'b0;
-        need_set_d = 1'b0;
-        fault_vpn = lookup_vpn;
-        found = 1'b0;
-        found_idx = '0;
-        found_entry = '0;
-        perm_ok = 1'b0;
-        need_a_update = 1'b0;
-        need_d_update = 1'b0;
-        
+        access_fault      = 1'b0;
+        need_set_a        = 1'b0;
+        need_set_d        = 1'b0;
+        fault_vpn         = lookup_vpn;
+        found             = 1'b0;
+        found_idx         = '0;
+        found_entry       = '0;
+        need_invalidate   = 1'b0;
+        invalidate_idx    = '0;
+
         if (lookup_valid) begin
-            // Busca na TLB
             for (int i = 0; i < TLB_ENTRIES; i++) begin
                 if (entries[i].valid &&
                     vpn_match(entries[i].vpn, lookup_vpn, entries[i].page_size) &&
                     (entries[i].g || entries[i].asid == lookup_asid)) begin
-                    
-                    found = 1'b1;
-                    found_idx = i;
+                    found       = 1'b1;
+                    found_idx   = i[$clog2(TLB_ENTRIES)-1:0];
                     found_entry = entries[i];
                 end
             end
-            
+
             if (found) begin
-                lookup_hit = 1'b1;
-                lookup_ppn = build_ppn(found_entry.ppn, lookup_vpn, found_entry.page_size);
-                
-                // ============================================================
-                // Verificação de Permissões
-                // ============================================================
-                
-                // Verificar acesso U-mode
+                // Verificar permissões
                 if (lookup_priv == PRIV_U && !found_entry.u) begin
-                    // User tentando acessar página não-User
+                    access_fault = 1'b1;
+                end else if (lookup_priv == PRIV_S && found_entry.u && !mstatus_sum) begin
+                    access_fault = 1'b1;
+                end else if (lookup_is_store && !found_entry.w) begin
+                    access_fault = 1'b1;
+                end else if (lookup_is_exec && !found_entry.x) begin
+                    access_fault = 1'b1;
+                end else if (!lookup_is_store && !lookup_is_exec &&
+                             !found_entry.r && !(found_entry.x && mstatus_mxr)) begin
                     access_fault = 1'b1;
                 end
-                // Verificar acesso S-mode a página User
-                else if (lookup_priv == PRIV_S && found_entry.u && !mstatus_sum) begin
-                    // Supervisor tentando acessar página User sem SUM
-                    access_fault = 1'b1;
-                end
-                // Verificar permissão de escrita
-                else if (lookup_is_store && !found_entry.w) begin
-                    access_fault = 1'b1;
-                end
-                // Verificar permissão de execução
-                else if (lookup_is_exec && !found_entry.x) begin
-                    access_fault = 1'b1;
-                end
-                // Verificar permissão de leitura
-                else if (!lookup_is_store && !lookup_is_exec) begin
-                    // Load: precisa R, ou (X com MXR)
-                    if (!found_entry.r && !(found_entry.x && mstatus_mxr)) begin
-                        access_fault = 1'b1;
-                    end
-                end
-                
-                // ============================================================
-                // Verificar bits A/D
-                // ============================================================
-                
-                if (!access_fault) begin
-                    // Bit A (Accessed) deve estar setado
-                    if (!found_entry.a) begin
-                        need_set_a = 1'b1;
-                        lookup_page_fault = 1'b1; // Gera page fault para software setar A
-                    end
-                    
-                    // Bit D (Dirty) deve estar setado para stores
-                    if (lookup_is_store && !found_entry.d) begin
-                        need_set_d = 1'b1;
-                        lookup_page_fault = 1'b1; // Gera page fault para software setar D
-                    end
-                end
-                
-                // Se houve violação de permissão, é page fault
+
                 if (access_fault) begin
+                    // Violação de permissão = page fault
                     lookup_page_fault = 1'b1;
+                    lookup_hit        = 1'b0;  // não retorna PPN em caso de fault
+                end else begin
+                    // FIX 1: verificar A/D APÓS permissões passarem
+                    // Se A/D precisam ser setados, dar miss (não page fault)
+                    // para que o PTW walk aconteça e atualize a PTE.
+                    if (!found_entry.a || (lookup_is_store && !found_entry.d)) begin
+                        need_set_a      = !found_entry.a;
+                        need_set_d      = lookup_is_store && !found_entry.d;
+                        // Miss: não hit, sem fault — PTW vai atualizar
+                        lookup_hit        = 1'b0;
+                        need_invalidate   = 1'b1;
+                        invalidate_idx    = found_idx;
+                    end else begin
+                        // Hit válido com A/D corretos
+                        lookup_hit = 1'b1;
+                        lookup_ppn = build_ppn(found_entry.ppn, lookup_vpn, found_entry.page_size);
+                    end
                 end
-                
-            end else begin
-                // TLB miss - não é fault, precisa page walk
-                lookup_hit = 1'b0;
             end
+            // Miss (found=0): PTW walk necessário, sem sinalizar fault
         end
     end
 
     // =========================================================================
-    // Lógica Sequencial
+    // Sequential
     // =========================================================================
-    
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            for (int i = 0; i < TLB_ENTRIES; i++) begin
+            for (int i = 0; i < TLB_ENTRIES; i++)
                 entries[i].valid <= 1'b0;
-            end
             replace_ptr <= '0;
         end else begin
-            // =================================================================
-            // Invalidação
-            // =================================================================
-            
+            // Invalidação por A/D desatualizado (forçar PTW walk)
+            if (need_invalidate)
+                entries[invalidate_idx].valid <= 1'b0;
+
+            // SFENCE.VMA
             if (invalidate_all) begin
-                // SFENCE.VMA x0, x0 - Invalida tudo
-                for (int i = 0; i < TLB_ENTRIES; i++) begin
+                for (int i = 0; i < TLB_ENTRIES; i++)
                     entries[i].valid <= 1'b0;
-                end
-            end
-            else if (invalidate_by_asid) begin
-                // SFENCE.VMA x0, rs2 - Invalida por ASID
+            end else if (invalidate_by_asid) begin
                 for (int i = 0; i < TLB_ENTRIES; i++) begin
-                    if (entries[i].valid && 
-                        !entries[i].g &&  // Global pages não são afetadas
-                        entries[i].asid == invalidate_asid) begin
+                    if (entries[i].valid && !entries[i].g &&
+                        entries[i].asid == invalidate_asid)
                         entries[i].valid <= 1'b0;
-                    end
                 end
-            end
-            else if (invalidate_by_addr) begin
-                // SFENCE.VMA rs1, x0 - Invalida por endereço (todos ASIDs)
+            end else if (invalidate_by_addr) begin
                 for (int i = 0; i < TLB_ENTRIES; i++) begin
                     if (entries[i].valid &&
-                        vpn_match(entries[i].vpn, invalidate_vpn, entries[i].page_size)) begin
+                        vpn_match(entries[i].vpn, invalidate_vpn, entries[i].page_size))
                         entries[i].valid <= 1'b0;
-                    end
                 end
-            end
-            else if (invalidate_by_both) begin
-                // SFENCE.VMA rs1, rs2 - Invalida por endereço e ASID
+            end else if (invalidate_by_both) begin
                 for (int i = 0; i < TLB_ENTRIES; i++) begin
-                    if (entries[i].valid &&
-                        !entries[i].g &&
+                    if (entries[i].valid && !entries[i].g &&
                         entries[i].asid == invalidate_asid &&
-                        vpn_match(entries[i].vpn, invalidate_vpn, entries[i].page_size)) begin
+                        vpn_match(entries[i].vpn, invalidate_vpn, entries[i].page_size))
                         entries[i].valid <= 1'b0;
-                    end
                 end
-            end
-            
-            // =================================================================
-            // Inserção
-            // =================================================================
-            
-            else if (insert_valid) begin
+            end else if (insert_valid) begin
                 entries[replace_ptr].valid     <= 1'b1;
                 entries[replace_ptr].vpn       <= insert_vpn;
                 entries[replace_ptr].ppn       <= insert_ppn;
@@ -307,8 +239,7 @@ module tlb_sv39 #(
                 entries[replace_ptr].g         <= insert_g;
                 entries[replace_ptr].a         <= insert_a;
                 entries[replace_ptr].d         <= insert_d;
-                
-                // Avançar ponteiro de substituição
+
                 if (replace_ptr == TLB_ENTRIES - 1)
                     replace_ptr <= '0;
                 else

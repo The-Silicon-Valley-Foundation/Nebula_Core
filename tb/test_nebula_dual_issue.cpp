@@ -1,5 +1,5 @@
 #include <iostream>
-#include "Vnebula_core.h"   // O cabeçalho gerado pelo Verilator
+#include "Vnebula_core_full.h"   // O cabeçalho gerado pelo Verilator
 #include "verilated.h"
 #include "verilated_vcd_c.h" // Biblioteca nativa de ondas do Verilator
 
@@ -12,7 +12,7 @@ int main(int argc, char** argv) {
     Verilated::traceEverOn(true);
 
     // Instancia o nosso processador e o gerador de ondas
-    Vnebula_core* top = new Vnebula_core;
+    Vnebula_core_full* top = new Vnebula_core_full;
     VerilatedVcdC* tfp = new VerilatedVcdC;
 
     // Configura o VCD para gravar até 99 níveis de profundidade
@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
     int imem_wait = 0;
 
     // Roda a simulação por 150 meios-ciclos (75 ciclos de clock completos)
-    for (int i = 0; i < 150; i++) {
+    for (int i = 0; i < 150000; i++) {
         top->clk = !top->clk; // Inverte o clock
 
         // Liberta o Reset após 10 unidades de tempo

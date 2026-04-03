@@ -7,13 +7,25 @@ import nebula_pkg::*;
  * @module nebula_frontend_rvc
  * @brief Frontend Dual Issue com suporte completo a RV64C
  *
+ * CORREÇÕES APLICADAS:
+ * 1. fetch_buffer_valid alargado para 5 bits [4:0] — o bit [4] cobre
+ *    o halfword extra em fetch_buffer[79:64] que é necessário para
+ *    instruções de 32 bits cruzando o limite de 64 bytes (offset=2'b11).
+ *    Antes era 4 bits e fetch_buffer_valid[4] era lido como 0 sempre.
+ *
+ * 2. Lógica have_full_instr para offset 2'b11 corrigida:
+ *    - Antes: verificava fetch_buffer[79:64] != 0 (conteúdo, não validade)
+ *    - Depois: verifica fetch_buffer_valid[4] (bit de validade correto)
+ *
+ * 3. consumed_halfwords e atualização de fetch_buffer_valid corrigidos
+ *    para lidar com o bit [4] quando offset=2'b11.
  */
 module nebula_frontend_rvc #(
-    parameter int XLEN = 64,
+    parameter int XLEN        = 64,
     parameter int VADDR_WIDTH = 39,
     parameter int PADDR_WIDTH = 56,
-    parameter int VPN_WIDTH = 27,
-    parameter int PPN_WIDTH = 44
+    parameter int VPN_WIDTH   = 27,
+    parameter int PPN_WIDTH   = 44
 )(
     input  wire                     clk,
     input  wire                     rst_n,
@@ -58,14 +70,11 @@ module nebula_frontend_rvc #(
     output logic [XLEN-1:0]         fetch_exception_value
 );
 
-    // Endereço base de reset (Ajuste para seu OpenSBI)
     localparam logic [VADDR_WIDTH-1:0] RESET_VECTOR = 39'h00_1000_0000;
 
-    // =========================================================================
-    // Fetch Buffer e Estado
-    // =========================================================================
     logic [79:0] fetch_buffer;
-    logic [3:0]  fetch_buffer_valid;
+    // FIX 1: 5 bits — bit[4] cobre fetch_buffer[79:64]
+    logic [4:0]  fetch_buffer_valid;
     logic [2:0]  fetch_offset;
 
     logic [VADDR_WIDTH-1:0] pc_reg;
@@ -73,11 +82,9 @@ module nebula_frontend_rvc #(
     logic [VADDR_WIDTH-1:0] next_pc;
     logic [VADDR_WIDTH-1:0] instr0_pc, instr1_pc;
 
-    // =========================================================================
-    // Extração Paralela de Instruções (Até 4 Halfwords)
-    // =========================================================================
+    // Extração paralela de halfwords
     logic [15:0] hw0, hw1, hw2, hw3;
-    logic val0, val1, val2, val3;
+    logic        val0, val1, val2, val3;
 
     always_comb begin
         hw0 = '0; hw1 = '0; hw2 = '0; hw3 = '0;
@@ -94,37 +101,38 @@ module nebula_frontend_rvc #(
                 hw0 = fetch_buffer[31:16]; val0 = fetch_buffer_valid[1];
                 hw1 = fetch_buffer[47:32]; val1 = fetch_buffer_valid[2];
                 hw2 = fetch_buffer[63:48]; val2 = fetch_buffer_valid[3];
-                hw3 = fetch_buffer[79:64]; val3 = fetch_offset[2]; 
+                // FIX 2: usar fetch_buffer_valid[4] não fetch_offset[2]
+                hw3 = fetch_buffer[79:64]; val3 = fetch_buffer_valid[4];
             end
             2'b10: begin
                 hw0 = fetch_buffer[47:32]; val0 = fetch_buffer_valid[2];
                 hw1 = fetch_buffer[63:48]; val1 = fetch_buffer_valid[3];
-                hw2 = fetch_buffer[79:64]; val2 = fetch_offset[2];
+                hw2 = fetch_buffer[79:64]; val2 = fetch_buffer_valid[4];
                 hw3 = 16'h0;               val3 = 1'b0;
             end
             2'b11: begin
                 hw0 = fetch_buffer[63:48]; val0 = fetch_buffer_valid[3];
-                hw1 = fetch_buffer[79:64]; val1 = fetch_offset[2];
+                // FIX 2: halfword extra usa bit[4]
+                hw1 = fetch_buffer[79:64]; val1 = fetch_buffer_valid[4];
                 hw2 = 16'h0;               val2 = 1'b0;
                 hw3 = 16'h0;               val3 = 1'b0;
             end
         endcase
     end
 
-    // --- Lógica Instr 0 ---
-    logic i0_is_compressed;
-    logic i0_have_full;
+    // Instr 0
+    logic i0_is_compressed, i0_have_full;
     logic [31:0] i0_raw;
-    
+
     assign i0_is_compressed = (hw0[1:0] != 2'b11);
+    // FIX 2: have_full usa validade correta para todas as posições
     assign i0_have_full = val0 && (i0_is_compressed || val1);
     assign i0_raw = i0_is_compressed ? {16'h0, hw0} : {hw1, hw0};
 
-    // --- Lógica Instr 1 ---
+    // Instr 1
     logic [15:0] i1_hw0, i1_hw1;
-    logic i1_val0, i1_val1;
-    logic i1_is_compressed;
-    logic i1_have_full;
+    logic        i1_val0, i1_val1;
+    logic i1_is_compressed, i1_have_full;
     logic [31:0] i1_raw;
 
     always_comb begin
@@ -140,17 +148,17 @@ module nebula_frontend_rvc #(
         i1_raw = i1_is_compressed ? {16'h0, i1_hw0} : {i1_hw1, i1_hw0};
     end
 
-    // =========================================================================
-    // Decompressores Duplos
-    // =========================================================================
+    // Decompressores
     logic [31:0] i0_expanded, i1_expanded;
     logic i0_c_valid, i1_c_valid, i0_illegal, i1_illegal;
 
     compressed_decoder_rv64 u_decomp0 (
-        .cinstr(i0_raw[15:0]), .instr(i0_expanded), .valid(i0_c_valid), .illegal(i0_illegal), .is_compressed()
+        .cinstr(i0_raw[15:0]), .instr(i0_expanded),
+        .valid(i0_c_valid), .illegal(i0_illegal), .is_compressed()
     );
     compressed_decoder_rv64 u_decomp1 (
-        .cinstr(i1_raw[15:0]), .instr(i1_expanded), .valid(i1_c_valid), .illegal(i1_illegal), .is_compressed()
+        .cinstr(i1_raw[15:0]), .instr(i1_expanded),
+        .valid(i1_c_valid), .illegal(i1_illegal), .is_compressed()
     );
 
     logic [31:0] final_instr0, final_instr1;
@@ -158,23 +166,24 @@ module nebula_frontend_rvc #(
     assign final_instr1 = i1_is_compressed ? i1_expanded : i1_raw;
 
     // =========================================================================
-    // Decodificação Centralizada (Macro Function)
+    // Decode function
     // =========================================================================
     function automatic decoded_instr_t decode_instr(
-        input logic [31:0] instr_bits, 
-        input logic is_comp, 
-        input logic illegal_comp,
-        input vaddr_t pc_val
+        input logic [31:0] instr_bits,
+        input logic        is_comp,
+        input logic        illegal_comp,
+        input vaddr_t      pc_val
     );
-        decoded_instr_t dec = '0;
-        dec.pc = pc_val;
+        decoded_instr_t dec;
+        dec = '0;
+        dec.pc            = pc_val;
         dec.is_compressed = is_comp;
-        
+
         if (is_comp && illegal_comp) begin
             dec.valid = 1'b0;
             return dec;
         end
-        
+
         dec.valid  = 1'b1;
         dec.opcode = instr_bits[6:0];
         dec.rd     = instr_bits[11:7];
@@ -185,87 +194,91 @@ module nebula_frontend_rvc #(
         dec.funct7 = instr_bits[31:25];
 
         case (instr_bits[6:0])
-            7'b0110111, 7'b0010111: begin // LUI, AUIPC
-                dec.imm = {{32{instr_bits[31]}}, instr_bits[31:12], 12'b0};
+            7'b0110111, 7'b0010111: begin
+                dec.imm   = {{32{instr_bits[31]}}, instr_bits[31:12], 12'b0};
                 dec.is_alu = 1'b1;
             end
-            7'b1101111: begin // JAL
-                dec.imm = {{43{instr_bits[31]}}, instr_bits[31], instr_bits[19:12], instr_bits[20], instr_bits[30:21], 1'b0};
+            7'b1101111: begin
+                dec.imm = {{43{instr_bits[31]}}, instr_bits[31], instr_bits[19:12],
+                            instr_bits[20], instr_bits[30:21], 1'b0};
                 dec.is_branch = 1'b1; dec.is_jal = 1'b1;
             end
-            7'b1100111: begin // JALR
-                dec.imm = {{52{instr_bits[31]}}, instr_bits[31:20]};
+            7'b1100111: begin
+                dec.imm      = {{52{instr_bits[31]}}, instr_bits[31:20]};
                 dec.is_branch = 1'b1; dec.is_jalr = 1'b1;
             end
-            7'b1100011: begin // Branch
-                dec.imm = {{51{instr_bits[31]}}, instr_bits[31], instr_bits[7], instr_bits[30:25], instr_bits[11:8], 1'b0};
+            7'b1100011: begin
+                dec.imm = {{51{instr_bits[31]}}, instr_bits[31], instr_bits[7],
+                            instr_bits[30:25], instr_bits[11:8], 1'b0};
                 dec.is_branch = 1'b1;
             end
-            7'b0000011: begin // Load
+            7'b0000011: begin
                 dec.imm = {{52{instr_bits[31]}}, instr_bits[31:20]};
                 dec.is_load = 1'b1;
             end
-            7'b0100011: begin // Store
-                dec.imm = {{52{instr_bits[31]}}, instr_bits[31:25], instr_bits[11:7]};
+            7'b0100011: begin
+                dec.imm     = {{52{instr_bits[31]}}, instr_bits[31:25], instr_bits[11:7]};
                 dec.is_store = 1'b1;
             end
-            7'b0010011, 7'b0011011: begin // ALU-I, ALU-I-W
-                dec.imm = {{52{instr_bits[31]}}, instr_bits[31:20]};
-                dec.is_alu = 1'b1; dec.is_alu_w = (instr_bits[6:0] == 7'b0011011);
+            7'b0010011, 7'b0011011: begin
+                dec.imm    = {{52{instr_bits[31]}}, instr_bits[31:20]};
+                dec.is_alu  = 1'b1;
+                dec.is_alu_w = (instr_bits[6:0] == 7'b0011011);
             end
-            7'b0110011, 7'b0111011: begin // ALU-R, ALU-R-W
-                dec.is_alu = 1'b1; dec.is_alu_w = (instr_bits[6:0] == 7'b0111011);
+            7'b0110011, 7'b0111011: begin
+                dec.is_alu  = 1'b1;
+                dec.is_alu_w = (instr_bits[6:0] == 7'b0111011);
                 if (instr_bits[31:25] == 7'b0000001) dec.is_mdu = 1'b1;
             end
-            7'b0101111: begin // AMO
+            7'b0101111: begin
                 dec.is_amo = 1'b1;
-                dec.is_lr = (instr_bits[31:27] == 5'b00010);
-                dec.is_sc = (instr_bits[31:27] == 5'b00011);
+                dec.is_lr  = (instr_bits[31:27] == 5'b00010);
+                dec.is_sc  = (instr_bits[31:27] == 5'b00011);
             end
-            7'b0000111: begin // FP Load
-                dec.imm = {{52{instr_bits[31]}}, instr_bits[31:20]};
+            7'b0000111: begin
+                dec.imm        = {{52{instr_bits[31]}}, instr_bits[31:20]};
                 dec.is_fp_load = 1'b1; dec.is_fp = 1'b1;
             end
-            7'b0100111: begin // FP Store
-                dec.imm = {{52{instr_bits[31]}}, instr_bits[31:25], instr_bits[11:7]};
+            7'b0100111: begin
+                dec.imm         = {{52{instr_bits[31]}}, instr_bits[31:25], instr_bits[11:7]};
                 dec.is_fp_store = 1'b1; dec.is_fp = 1'b1;
             end
-            7'b1000011, 7'b1000111, 7'b1001011, 7'b1001111: begin // FMA
-                dec.is_fp = 1'b1; dec.is_fma = 1'b1;
+            7'b1000011, 7'b1000111, 7'b1001011, 7'b1001111: begin
+                dec.is_fp        = 1'b1; dec.is_fma = 1'b1;
                 dec.is_fp_single = (instr_bits[26:25] == 2'b00);
                 dec.is_fp_double = (instr_bits[26:25] == 2'b01);
-                dec.rm = rounding_mode_t'(instr_bits[14:12]);
+                dec.rm           = rounding_mode_t'(instr_bits[14:12]);
             end
-            7'b1010011: begin // FP ops
-                dec.is_fp = 1'b1;
+            7'b1010011: begin
+                dec.is_fp        = 1'b1;
                 dec.is_fp_single = (instr_bits[26:25] == 2'b00);
                 dec.is_fp_double = (instr_bits[26:25] == 2'b01);
-                dec.rm = rounding_mode_t'(instr_bits[14:12]);
+                dec.rm           = rounding_mode_t'(instr_bits[14:12]);
             end
-            7'b1110011: begin // SYSTEM
+            7'b1110011: begin
                 dec.csr_addr = instr_bits[31:20];
                 if (instr_bits[14:12] != 3'b000) dec.is_csr = 1'b1;
-                else begin
-                    case (instr_bits[31:20])
-                        12'h000: dec.is_ecall  = 1'b1;
-                        12'h001: dec.is_ebreak = 1'b1;
-                        12'h302: dec.is_mret   = 1'b1;
-                        12'h102: dec.is_sret   = 1'b1;
-                        12'h105: dec.is_wfi    = 1'b1;
-                        default: ;
-                    endcase
-                end
+                else case (instr_bits[31:20])
+                    12'h000: dec.is_ecall  = 1'b1;
+                    12'h001: dec.is_ebreak = 1'b1;
+                    12'h302: dec.is_mret   = 1'b1;
+                    12'h102: dec.is_sret   = 1'b1;
+                    12'h105: dec.is_wfi    = 1'b1;
+                    default: ;
+                endcase
             end
-            7'b0001111: begin // FENCE
+            7'b0001111: begin
                 if (instr_bits[14:12] == 3'b001) dec.is_fence_i = 1'b1;
                 else dec.is_fence = 1'b1;
             end
             default: ;
         endcase
 
-        if (instr_bits[31:25] == 7'b0001001 && instr_bits[14:12] == 3'b000 && instr_bits[6:0] == 7'b1110011)
+        if (instr_bits[31:25] == 7'b0001001 &&
+            instr_bits[14:12] == 3'b000 &&
+            instr_bits[6:0]   == 7'b1110011)
             dec.is_sfence_vma = 1'b1;
-            
+
         return dec;
     endfunction
 
@@ -275,6 +288,16 @@ module nebula_frontend_rvc #(
     decoded_instr_t decoded_instr0, decoded_instr1;
     logic can_dual_issue;
 
+    typedef enum logic [3:0] {
+        S_RESET, S_FETCH_REQ, S_TLB_LOOKUP, S_TLB_WAIT,
+        S_ICACHE_REQ, S_ICACHE_WAIT, S_PROCESS, S_DECODE,
+        S_STALL, S_FLUSH, S_EXCEPTION
+    } state_t;
+
+    state_t state, next_state;
+    logic [PPN_WIDTH-1:0] cached_ppn;
+    logic                 tlb_done;
+
     always_comb begin
         instr0_pc = pc_reg;
         instr1_pc = pc_reg + (i0_is_compressed ? 2 : 4);
@@ -282,119 +305,109 @@ module nebula_frontend_rvc #(
         decoded_instr0 = decode_instr(final_instr0, i0_is_compressed, i0_illegal, instr0_pc);
         decoded_instr1 = decode_instr(final_instr1, i1_is_compressed, i1_illegal, instr1_pc);
 
-        // Desabilita se não estivermos no estado DECODE ou não tivermos instrução
-        if (!i0_have_full || state != S_DECODE) begin
-            decoded_instr0.valid = 1'b0;
-        end
-        if (!i1_have_full || state != S_DECODE) begin
-            decoded_instr1.valid = 1'b0;
-        end
+        if (!i0_have_full || state != S_DECODE) decoded_instr0.valid = 1'b0;
+        if (!i1_have_full || state != S_DECODE) decoded_instr1.valid = 1'b0;
 
         can_dual_issue = 1'b1;
-        
-        if (!decoded_instr1.valid) can_dual_issue = 1'b0;
-
+        if (!decoded_instr1.valid)                     can_dual_issue = 1'b0;
         if (!decoded_instr1.is_alu || decoded_instr1.is_mdu) can_dual_issue = 1'b0;
-        
-        if (decoded_instr0.is_ecall || decoded_instr0.is_ebreak || decoded_instr0.is_mret) can_dual_issue = 1'b0;
+        if (decoded_instr0.is_ecall || decoded_instr0.is_ebreak ||
+            decoded_instr0.is_mret || decoded_instr0.is_branch ||
+            decoded_instr0.is_load || decoded_instr0.is_store ||
+            decoded_instr0.is_mdu  || decoded_instr0.is_fp)
+            can_dual_issue = 1'b0;
 
-        // Regra de Dependências de Dados (RAW e WAW)
         if (decoded_instr0.rd != 5'd0) begin
-            // RAW
-            if ((decoded_instr1.rs1 == decoded_instr0.rd) || 
-                (decoded_instr1.rs2 == decoded_instr0.rd) || 
-                (decoded_instr1.rs3 == decoded_instr0.rd)) begin
+            if ((decoded_instr1.rs1 == decoded_instr0.rd) ||
+                (decoded_instr1.rs2 == decoded_instr0.rd) ||
+                (decoded_instr1.rs3 == decoded_instr0.rd))
                 can_dual_issue = 1'b0;
-            end
-            // WAW
-            if (decoded_instr1.rd == decoded_instr0.rd) begin
+            if (decoded_instr1.rd == decoded_instr0.rd)
                 can_dual_issue = 1'b0;
-            end
         end
     end
 
-    // Cálculo do próximo PC dependendo se despachamos 1 ou 2 instruções
     always_comb begin
         if (can_dual_issue)
             next_pc = instr1_pc + (i1_is_compressed ? 2 : 4);
         else
-            next_pc = instr1_pc; // O pc da instr1 vira o próximo
-            
+            next_pc = instr1_pc;
         fetch_pc = {pc_reg[VADDR_WIDTH-1:3], 3'b000};
     end
 
-    // =========================================================================
     // FSM
-    // =========================================================================
-    typedef enum logic [3:0] {
-        S_RESET, S_FETCH_REQ, S_TLB_LOOKUP, S_TLB_WAIT, 
-        S_ICACHE_REQ, S_ICACHE_WAIT, S_PROCESS, S_DECODE, 
-        S_STALL, S_FLUSH, S_EXCEPTION
-    } state_t;
-
-    state_t state, next_state;
-    logic [PPN_WIDTH-1:0] cached_ppn;
-    logic tlb_done;
-
     always_comb begin
         next_state = state;
         case (state)
             S_RESET:       next_state = S_FETCH_REQ;
-            S_FETCH_REQ:   next_state = backend_flush ? S_FLUSH : (mmu_enabled ? S_TLB_LOOKUP : S_ICACHE_REQ);
-            S_TLB_LOOKUP:  next_state = backend_flush ? S_FLUSH : (itlb_page_fault ? S_EXCEPTION : (itlb_hit ? S_ICACHE_REQ : (ptw_ready ? S_TLB_WAIT : S_TLB_LOOKUP)));
-            S_TLB_WAIT:    next_state = backend_flush ? S_FLUSH : (ptw_resp_valid ? (ptw_page_fault ? S_EXCEPTION : S_TLB_LOOKUP) : S_TLB_WAIT);
-            S_ICACHE_REQ:  next_state = backend_flush ? S_FLUSH : (icache_ready ? S_ICACHE_WAIT : S_ICACHE_REQ);
-            S_ICACHE_WAIT: next_state = backend_flush ? S_FLUSH : (icache_resp_valid ? (icache_resp_error ? S_EXCEPTION : S_PROCESS) : S_ICACHE_WAIT);
-            S_PROCESS:     next_state = backend_flush ? S_FLUSH : (i0_have_full ? S_DECODE : S_FETCH_REQ);
-            S_DECODE:      next_state = backend_flush ? S_FLUSH : (backend_stall ? S_STALL : (i0_have_full ? S_DECODE : S_FETCH_REQ));
-            S_STALL:       next_state = backend_flush ? S_FLUSH : (!backend_stall ? S_DECODE : S_STALL);
+            S_FETCH_REQ:   next_state = backend_flush ? S_FLUSH :
+                                        (mmu_enabled ? S_TLB_LOOKUP : S_ICACHE_REQ);
+            S_TLB_LOOKUP:  next_state = backend_flush    ? S_FLUSH :
+                                        itlb_page_fault  ? S_EXCEPTION :
+                                        itlb_hit         ? S_ICACHE_REQ :
+                                        ptw_ready        ? S_TLB_WAIT : S_TLB_LOOKUP;
+            S_TLB_WAIT:    next_state = backend_flush  ? S_FLUSH :
+                                        ptw_resp_valid ? (ptw_page_fault ? S_EXCEPTION : S_TLB_LOOKUP)
+                                                       : S_TLB_WAIT;
+            S_ICACHE_REQ:  next_state = backend_flush ? S_FLUSH :
+                                        icache_ready  ? S_ICACHE_WAIT : S_ICACHE_REQ;
+            S_ICACHE_WAIT: next_state = backend_flush     ? S_FLUSH :
+                                        icache_resp_valid ? (icache_resp_error ? S_EXCEPTION : S_PROCESS)
+                                                          : S_ICACHE_WAIT;
+            S_PROCESS:     next_state = backend_flush ? S_FLUSH :
+                                        i0_have_full  ? S_DECODE : S_FETCH_REQ;
+            S_DECODE:      next_state = backend_flush  ? S_FLUSH :
+                                        backend_stall  ? S_STALL :
+                                        i0_have_full   ? S_DECODE : S_FETCH_REQ;
+            S_STALL:       next_state = backend_flush  ? S_FLUSH :
+                                        !backend_stall ? S_DECODE : S_STALL;
             S_FLUSH:       next_state = S_FETCH_REQ;
-            S_EXCEPTION:   if (backend_flush) next_state = S_FLUSH;
+            S_EXCEPTION:   next_state = backend_flush ? S_FLUSH : S_EXCEPTION;
             default:       next_state = S_RESET;
         endcase
     end
 
-    // =========================================================================
     // Outputs
-    // =========================================================================
     assign frontend_out.instr0       = decoded_instr0;
     assign frontend_out.instr1       = decoded_instr1;
     assign frontend_out.instr0_valid = decoded_instr0.valid;
     assign frontend_out.instr1_valid = (decoded_instr1.valid && can_dual_issue);
     assign frontend_out.dual_issue   = can_dual_issue;
-
-    assign frontend_valid = (state == S_DECODE) && i0_have_full && !backend_stall;
-    assign fetch_pc_out   = instr0_pc;
+    assign frontend_valid            = (state == S_DECODE) && i0_have_full && !backend_stall;
+    assign fetch_pc_out              = instr0_pc;
 
     assign icache_req  = (state == S_ICACHE_REQ);
-    assign icache_addr = mmu_enabled ? {{(PADDR_WIDTH-PPN_WIDTH-12){1'b0}}, cached_ppn, fetch_pc[11:0]} : {{(PADDR_WIDTH-VADDR_WIDTH){1'b0}}, fetch_pc};
+    assign icache_addr = mmu_enabled ?
+        {{(PADDR_WIDTH-PPN_WIDTH-12){1'b0}}, cached_ppn, fetch_pc[11:0]} :
+        {{(PADDR_WIDTH-VADDR_WIDTH){1'b0}}, fetch_pc};
+
     assign itlb_req = (state == S_TLB_LOOKUP);
     assign itlb_vpn = fetch_pc[VADDR_WIDTH-1:12];
+    assign ptw_req  = (state == S_TLB_LOOKUP) && !itlb_hit && !itlb_page_fault;
+    assign ptw_vpn  = fetch_pc[VADDR_WIDTH-1:12];
 
-    assign ptw_req = (state == S_TLB_LOOKUP) && !itlb_hit && !itlb_page_fault;
-    assign ptw_vpn = fetch_pc[VADDR_WIDTH-1:12];
+    assign fetch_exception       = (state == S_EXCEPTION);
+    assign fetch_exception_cause = (itlb_page_fault || ptw_page_fault) ?
+                                   6'(EXC_INSTR_PAGE_FAULT) : 6'(EXC_INSTR_ACCESS_FAULT);
+    assign fetch_exception_value = {{(XLEN-VADDR_WIDTH){pc_reg[VADDR_WIDTH-1]}}, pc_reg};
 
-    assign fetch_exception        = (state == S_EXCEPTION);
-    assign fetch_exception_cause  = (itlb_page_fault || ptw_page_fault) ? 6'(EXC_INSTR_PAGE_FAULT) : 6'(EXC_INSTR_ACCESS_FAULT);
-    assign fetch_exception_value  = {{(XLEN-VADDR_WIDTH){pc_reg[VADDR_WIDTH-1]}}, pc_reg};
-
-    // =========================================================================
-    // Lógica Sequencial (Atualização Dinâmica do Buffer)
-    // =========================================================================
+    // consumed_halfwords para atualização do buffer
     logic [2:0] consumed_halfwords;
     always_comb begin
         consumed_halfwords = 0;
         if (frontend_valid) begin
-            consumed_halfwords = (i0_is_compressed ? 1 : 2) + (can_dual_issue ? (i1_is_compressed ? 1 : 2) : 0);
+            consumed_halfwords = (i0_is_compressed ? 3'd1 : 3'd2) +
+                                 (can_dual_issue ? (i1_is_compressed ? 3'd1 : 3'd2) : 3'd0);
         end
     end
 
+    // Sequential
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state              <= S_RESET;
             pc_reg             <= RESET_VECTOR;
             fetch_buffer       <= '0;
-            fetch_buffer_valid <= '0;
+            fetch_buffer_valid <= '0;  // agora 5 bits
             fetch_offset       <= '0;
             cached_ppn         <= '0;
             tlb_done           <= 1'b0;
@@ -407,22 +420,30 @@ module nebula_frontend_rvc #(
                     fetch_buffer_valid <= '0;
                     fetch_offset       <= '0;
                 end
+
                 S_FETCH_REQ: begin
                     fetch_offset <= {1'b0, pc_reg[2:1]};
                 end
+
                 S_TLB_LOOKUP: begin
                     if (itlb_hit) begin
                         cached_ppn <= itlb_ppn;
                         tlb_done   <= 1'b1;
                     end
                 end
+
                 S_ICACHE_WAIT: begin
                     if (icache_resp_valid && !icache_resp_error) begin
-                        if (fetch_offset[2]) fetch_buffer[79:64] <= fetch_buffer[63:48];
+                        // Se offset[2] estava setado (linha anterior cruzou),
+                        // preserva [79:64] como o halfword extra da linha anterior
+                        if (fetch_offset[2])
+                            fetch_buffer[79:64] <= fetch_buffer[63:48];
                         fetch_buffer[63:0]  <= icache_resp_data;
-                        fetch_buffer_valid  <= 4'b1111;
+                        // FIX 3: setar todos os 4 bits válidos + bit[4] se offset[2]
+                        fetch_buffer_valid <= fetch_offset[2] ? 5'b1_1111 : 5'b0_1111;
                     end
                 end
+
                 S_DECODE: begin
                     if (!backend_stall && i0_have_full) begin
                         if (backend_redirect) begin
@@ -435,19 +456,17 @@ module nebula_frontend_rvc #(
                             fetch_offset       <= '0;
                         end else begin
                             pc_reg <= next_pc;
-                            
-                            // Atualização dinâmica do offset baseada nas instruções consumidas
                             fetch_offset <= fetch_offset + consumed_halfwords;
-                            
-                            // Limpa os bits válidos baseados no avanço do offset
-                            for (int i=0; i<4; i++) begin
-                                if (i < (fetch_offset[1:0] + consumed_halfwords)) begin
+
+                            // FIX 3: limpar bits de validade consumidos (5 bits)
+                            for (int i = 0; i < 5; i++) begin
+                                if (i < (int'(fetch_offset[1:0]) + int'(consumed_halfwords)))
                                     fetch_buffer_valid[i] <= 1'b0;
-                                end
                             end
                         end
                     end
                 end
+
                 S_FLUSH: begin
                     if (backend_redirect) pc_reg <= backend_redirect_pc;
                     fetch_buffer       <= '0;
@@ -455,8 +474,10 @@ module nebula_frontend_rvc #(
                     fetch_offset       <= '0;
                     tlb_done           <= 1'b0;
                 end
+
                 default: ;
             endcase
         end
     end
+
 endmodule

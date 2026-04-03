@@ -6,10 +6,18 @@
  * @brief Unidade de Multiplicação e Divisão para RV64M
  *
  * CORREÇÕES APLICADAS:
- * 1. Declarações de variáveis locais removidas de dentro de always_ff
- *    (logic temp_remainder, q, r) — movidas para sinais de módulo.
- *    Ferramentas de síntese (Vivado/Quartus) rejeitam declarações
- *    dentro de blocos procedurais sequenciais.
+ * 1. Condição de parada da divisão corrigida: div_counter >= div_iterations
+ *    comparava com o valor ANTES do incremento no mesmo ciclo, fazendo a
+ *    divisão parar 1 iteração cedo (quociente deslocado 1 bit).
+ *    FIX: comparar com (div_iterations - 1) para que a FSM transite
+ *    DEPOIS do último incremento de div_counter ser registrado.
+ *
+ * 2. always_comb de temp_remainder: declaração 'logic bit_idx' dentro
+ *    de always_comb é ilegal em alguns contextos de síntese.
+ *    FIX: promovido a sinal de módulo.
+ *
+ * 3. REM por zero: o resultado deve ser rs1 (não truncado), já sign-extended.
+ *    FIX: garantido pela seleção de op1_reg que já foi sign-extended.
  */
 module mdu_rv64 #(
     parameter int XLEN = 64
@@ -17,7 +25,6 @@ module mdu_rv64 #(
     input  wire                 clk,
     input  wire                 rst_n,
 
-    // Interface de Requisição
     input  wire                 req_valid,
     output logic                req_ready,
     input  wire [XLEN-1:0]      rs1_data,
@@ -25,12 +32,10 @@ module mdu_rv64 #(
     input  wire [2:0]           funct3,
     input  wire                 is_word_op,
 
-    // Interface de Resposta
     output logic                resp_valid,
     output logic [XLEN-1:0]     result
 );
 
-    // Opcodes da extensão M
     localparam logic [2:0] F3_MUL    = 3'b000;
     localparam logic [2:0] F3_MULH   = 3'b001;
     localparam logic [2:0] F3_MULHSU = 3'b010;
@@ -51,7 +56,6 @@ module mdu_rv64 #(
 
     state_t state, next_state;
 
-    // Registradores internos
     logic [XLEN-1:0]  op1_reg, op2_reg;
     logic [2:0]       funct3_reg;
     logic             is_word_reg;
@@ -60,13 +64,11 @@ module mdu_rv64 #(
     logic             result_negate;
     logic             remainder_negate;
 
-    // Multiplicação
     logic signed [XLEN:0]       mul_op1_signed;
     logic signed [XLEN:0]       mul_op2_signed;
     logic signed [2*XLEN+1:0]   mul_result_full;
     logic [2*XLEN-1:0]          mul_result_reg;
 
-    // Divisão iterativa
     logic [XLEN-1:0]  dividend_reg;
     logic [XLEN-1:0]  divisor_reg;
     logic [XLEN-1:0]  quotient_reg;
@@ -77,9 +79,6 @@ module mdu_rv64 #(
 
     wire [6:0] div_iterations = is_word_reg ? 7'd32 : 7'd64;
 
-    wire [XLEN-1:0] op1_abs = (op1_signed && op1_reg[XLEN-1]) ? -op1_reg : op1_reg;
-    wire [XLEN-1:0] op2_abs = (op2_signed && op2_reg[XLEN-1]) ? -op2_reg : op2_reg;
-
     wire [XLEN-1:0] op1_word = is_word_reg ?
         (op1_signed ? {{32{rs1_data[31]}}, rs1_data[31:0]} : {32'b0, rs1_data[31:0]}) :
         rs1_data;
@@ -87,27 +86,22 @@ module mdu_rv64 #(
         (op2_signed ? {{32{rs2_data[31]}}, rs2_data[31:0]} : {32'b0, rs2_data[31:0]}) :
         rs2_data;
 
-    // Sinais combinacionais para divisão — calculados em always_comb
-    // para evitar BLKSEQ (blocking assignment em always_ff)
+    // FIX 2: bit_idx promovido a sinal de módulo
+    logic [5:0]      bit_idx;
     logic [XLEN:0]   temp_remainder;
     logic [XLEN-1:0] div_q_final;
     logic [XLEN-1:0] div_r_final;
 
-    // temp_remainder: próximo remainder durante iteração de divisão
     always_comb begin
-        logic [5:0] bit_idx;
-        bit_idx = (is_word_reg ? 6'd31 : 6'd63) - div_counter[5:0];
-        
+        bit_idx        = (is_word_reg ? 6'd31 : 6'd63) - div_counter[5:0];
         temp_remainder = {remainder_reg[XLEN-2:0], dividend_reg[bit_idx]};
     end
 
-    // div_q_final / div_r_final: quociente e resto com sinal aplicado
     always_comb begin
         div_q_final = result_negate    ? -quotient_reg  : quotient_reg;
         div_r_final = remainder_negate ? -remainder_reg : remainder_reg;
     end
 
-    // Lógica de controle de sinais
     always_comb begin
         op1_signed = 1'b0;
         op2_signed = 1'b0;
@@ -126,7 +120,6 @@ module mdu_rv64 #(
         endcase
     end
 
-    // FSM - Transição de Estados
     always_comb begin
         next_state = state;
 
@@ -143,7 +136,12 @@ module mdu_rv64 #(
             S_MUL_STAGE2:  next_state = S_MUL_DONE;
             S_MUL_DONE:    next_state = S_IDLE;
             S_DIV_COMPUTE: begin
-                if (div_counter >= div_iterations || div_by_zero)
+                // FIX 1: comparar com (div_iterations - 1) pois div_counter
+                // é incrementado DENTRO deste estado — o valor visível pela FSM
+                // ainda é o pré-incremento. Ao atingir (iterations-1), o ff
+                // registrará (iterations) no próximo ciclo quando já estamos em
+                // S_DIV_DONE.
+                if (div_counter >= (div_iterations - 7'd1) || div_by_zero)
                     next_state = S_DIV_DONE;
             end
             S_DIV_DONE:    next_state = S_IDLE;
@@ -151,7 +149,6 @@ module mdu_rv64 #(
         endcase
     end
 
-    // FSM - Lógica Sequencial
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state            <= S_IDLE;
@@ -180,15 +177,15 @@ module mdu_rv64 #(
                     resp_valid <= 1'b0;
 
                     if (req_valid && req_ready) begin
-                        req_ready  <= 1'b0;
-                        funct3_reg <= funct3;
+                        req_ready   <= 1'b0;
+                        funct3_reg  <= funct3;
                         is_word_reg <= is_word_op;
-                        op1_reg    <= op1_word;
-                        op2_reg    <= op2_word;
+                        op1_reg     <= op1_word;
+                        op2_reg     <= op2_word;
 
                         if (is_div_op) begin
-                            div_counter  <= '0;
-                            div_by_zero  <= (op2_word == '0);
+                            div_counter <= '0;
+                            div_by_zero <= (op2_word == '0);
 
                             if (op1_signed && op2_signed) begin
                                 if (is_word_op)
@@ -252,7 +249,6 @@ module mdu_rv64 #(
 
                 S_DIV_COMPUTE: begin
                     if (!div_by_zero && !div_overflow) begin
-                        // temp_remainder calculado em always_comb acima
                         if (temp_remainder >= {1'b0, divisor_reg}) begin
                             remainder_reg <= temp_remainder[XLEN-1:0] - divisor_reg;
                             quotient_reg  <= {quotient_reg[XLEN-2:0], 1'b1};
@@ -260,7 +256,6 @@ module mdu_rv64 #(
                             remainder_reg <= temp_remainder[XLEN-1:0];
                             quotient_reg  <= {quotient_reg[XLEN-2:0], 1'b0};
                         end
-
                         div_counter <= div_counter + 1;
                     end
                 end
@@ -272,6 +267,7 @@ module mdu_rv64 #(
                     if (div_by_zero) begin
                         case (funct3_reg)
                             F3_DIV, F3_DIVU: result <= '1;
+                            // FIX 3: REM/REMU por zero retorna rs1 (op1_reg já sign-extended)
                             F3_REM, F3_REMU: begin
                                 if (is_word_reg)
                                     result <= {{32{op1_reg[31]}}, op1_reg[31:0]};
@@ -292,7 +288,6 @@ module mdu_rv64 #(
                             default: result <= '0;
                         endcase
                     end else begin
-                        // div_q_final e div_r_final calculados em always_comb acima
                         case (funct3_reg)
                             F3_DIV, F3_DIVU: begin
                                 if (is_word_reg)

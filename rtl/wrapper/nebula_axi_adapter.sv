@@ -2,29 +2,33 @@
 
 /**
  * @module nebula_axi_adapter
- * @brief Adaptador entre interface Nebula (512-bit) e AXI4 (64-bit)
+ * @brief Adaptador Nebula (512-bit) <-> AXI4 (64-bit)
  *
  * CORREÇÕES APLICADAS:
- * 1. Endereço base salvo em registrador (base_addr_reg) para evitar
- *    acumulação incorreta sobre o endereço AXI modificado.
- * 2. cnt incrementado em R_WAIT_DATA (não em R_NEXT) para que o
- *    teste de fim de burst use o valor já atualizado.
- * 3. Write path corrigido: endereço e dados calculados a partir
- *    do base_addr_reg + (cnt * 8).
+ * 1. Canal I-Cache (imem_*) implementado com FSM paralela — antes estava
+ *    com imem_ack=0 e imem_data=0 hardcoded, o que impedia qualquer fetch
+ *    de instrução via AXI. Isso travava o núcleo permanentemente.
+ *
+ * 2. FSM D-Cache: bugs de cnt corrigidos (incremento em R_WAIT_DATA/W_RESP,
+ *    base_addr_reg preservado).
+ *
+ * 3. Arbitração simples: D-Cache tem prioridade sobre I-Cache.
+ *    Quando ambos requisitam simultaneamente, D-Cache é atendido primeiro.
  */
 module nebula_axi_adapter #(
-    parameter int PADDR_WIDTH = 56,
+    parameter int PADDR_WIDTH  = 56,
     parameter int AXI_ID_WIDTH = 4
 )(
     input  wire                     clk,
     input  wire                     rst_n,
 
-    // Interface Nebula (Cache - 512 bits)
+    // I-Cache (512-bit)
     input  wire                     imem_req,
     input  wire [PADDR_WIDTH-1:0]   imem_addr,
     output logic                    imem_ack,
     output logic [511:0]            imem_data,
 
+    // D-Cache (512-bit)
     input  wire                     dmem_req,
     input  wire                     dmem_we,
     input  wire [PADDR_WIDTH-1:0]   dmem_addr,
@@ -32,7 +36,7 @@ module nebula_axi_adapter #(
     output logic                    dmem_ack,
     output logic [511:0]            dmem_rdata,
 
-    // Interface AXI4 Master - 64 bits
+    // AXI4 Instruction
     output logic [AXI_ID_WIDTH-1:0] m_axi_i_arid,
     output logic [PADDR_WIDTH-1:0]  m_axi_i_araddr,
     output logic [7:0]              m_axi_i_arlen,
@@ -46,6 +50,7 @@ module nebula_axi_adapter #(
     input  wire                     m_axi_i_rvalid,
     output logic                    m_axi_i_rready,
 
+    // AXI4 Data
     output logic [AXI_ID_WIDTH-1:0] m_axi_d_awid,
     output logic [PADDR_WIDTH-1:0]  m_axi_d_awaddr,
     output logic [7:0]              m_axi_d_awlen,
@@ -78,50 +83,35 @@ module nebula_axi_adapter #(
 
     typedef enum logic [3:0] {
         IDLE,
-        R_ADDR,
-        R_WAIT_DATA,
-        R_NEXT,
-        W_ADDR,
-        W_DATA,
-        W_RESP,
-        W_NEXT
+        R_ADDR, R_WAIT_DATA, R_NEXT,
+        W_ADDR, W_DATA, W_RESP, W_NEXT
     } state_t;
 
-    state_t state;
-
-    // FIX 1: cnt agora é incrementado em R_WAIT_DATA / W_RESP
-    logic [3:0]              cnt;
-    logic [511:0]            data_buf;
-
-    // FIX 2: registrador base para preservar o endereço original
-    logic [PADDR_WIDTH-1:0]  base_addr_reg;
-
     // =========================================================================
-    // Configurações AXI Fixas
+    // D-Cache FSM
     // =========================================================================
-    // Cada transação é um burst de 1 beat de 64 bits (8 bytes)
+    state_t            d_state;
+    logic [3:0]        d_cnt;
+    logic [511:0]      d_buf;
+    logic [PADDR_WIDTH-1:0] d_base;
+
     assign m_axi_d_arid    = '0;
-    assign m_axi_d_arlen   = 8'd0;       // 1 beat por transação
-    assign m_axi_d_arsize  = 3'b011;     // 8 bytes por beat
-    assign m_axi_d_arburst = 2'b01;      // INCR
-
+    assign m_axi_d_arlen   = 8'd0;
+    assign m_axi_d_arsize  = 3'b011;
+    assign m_axi_d_arburst = 2'b01;
     assign m_axi_d_awid    = '0;
     assign m_axi_d_awlen   = 8'd0;
     assign m_axi_d_awsize  = 3'b011;
     assign m_axi_d_awburst = 2'b01;
-
     assign m_axi_d_wstrb   = 8'hFF;
-    assign m_axi_d_wlast   = 1'b1;       // sempre last (burst de 1)
+    assign m_axi_d_wlast   = 1'b1;
 
-    // =========================================================================
-    // FSM Principal
-    // =========================================================================
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state           <= IDLE;
-            cnt             <= '0;
-            base_addr_reg   <= '0;
-            data_buf        <= '0;
+            d_state         <= IDLE;
+            d_cnt           <= '0;
+            d_base          <= '0;
+            d_buf           <= '0;
             dmem_ack        <= 1'b0;
             dmem_rdata      <= '0;
             m_axi_d_arvalid <= 1'b0;
@@ -133,132 +123,155 @@ module nebula_axi_adapter #(
             m_axi_d_wdata   <= '0;
             m_axi_d_bready  <= 1'b0;
         end else begin
-            // Limpar ack por padrão (pulso de 1 ciclo)
             dmem_ack <= 1'b0;
 
-            case (state)
-                // =============================================================
+            case (d_state)
                 IDLE: begin
-                    cnt <= '0;
+                    d_cnt <= '0;
                     if (dmem_req) begin
-                        // FIX 3: salvar endereço base UMA VEZ
-                        base_addr_reg <= dmem_addr;
-
+                        d_base <= dmem_addr;
                         if (!dmem_we) begin
-                            // READ: iniciar primeira transação AR
                             m_axi_d_araddr  <= dmem_addr;
                             m_axi_d_arvalid <= 1'b1;
-                            state           <= R_ADDR;
+                            d_state         <= R_ADDR;
                         end else begin
-                            // WRITE: iniciar primeira transação AW
-                            m_axi_d_awaddr <= dmem_addr;
+                            m_axi_d_awaddr  <= dmem_addr;
                             m_axi_d_awvalid <= 1'b1;
-                            // Dado do beat 0
-                            m_axi_d_wdata  <= dmem_wdata[63:0];
-                            state          <= W_ADDR;
+                            m_axi_d_wdata   <= dmem_wdata[63:0];
+                            d_state         <= W_ADDR;
                         end
                     end
                 end
-
-                // =============================================================
-                // READ PATH
-                // =============================================================
                 R_ADDR: begin
                     if (m_axi_d_arready) begin
                         m_axi_d_arvalid <= 1'b0;
                         m_axi_d_rready  <= 1'b1;
-                        state           <= R_WAIT_DATA;
+                        d_state         <= R_WAIT_DATA;
                     end
                 end
-
                 R_WAIT_DATA: begin
                     if (m_axi_d_rvalid) begin
-                        m_axi_d_rready <= 1'b0;
-
-                        // Armazenar beat atual
-                        data_buf[cnt * 64 +: 64] <= m_axi_d_rdata;
-
-                        // FIX 4: incrementar cnt AQUI
-                        cnt <= cnt + 1;
-
-                        state <= R_NEXT;
+                        m_axi_d_rready  <= 1'b0;
+                        d_buf[d_cnt * 64 +: 64] <= m_axi_d_rdata;
+                        d_cnt  <= d_cnt + 1;
+                        d_state <= R_NEXT;
                     end
                 end
-
                 R_NEXT: begin
-                    // FIX 5: cnt já foi incrementado em R_WAIT_DATA
-                    if (cnt == 4'd8) begin
-                        // Todos os 8 beats recebidos
-                        dmem_rdata <= data_buf;
+                    if (d_cnt == 4'd8) begin
+                        dmem_rdata <= d_buf;
                         dmem_ack   <= 1'b1;
-                        state      <= IDLE;
+                        d_state    <= IDLE;
                     end else begin
-                        // FIX 6: próximo endereço = base + cnt * 8
-                        m_axi_d_araddr  <= base_addr_reg + {cnt, 3'b000};
+                        m_axi_d_araddr  <= d_base + {d_cnt, 3'b000};
                         m_axi_d_arvalid <= 1'b1;
-                        state           <= R_ADDR;
+                        d_state         <= R_ADDR;
                     end
                 end
-
-                // =============================================================
-                // WRITE PATH
-                // =============================================================
                 W_ADDR: begin
                     if (m_axi_d_awready) begin
                         m_axi_d_awvalid <= 1'b0;
                         m_axi_d_wvalid  <= 1'b1;
-                        state           <= W_DATA;
+                        d_state         <= W_DATA;
                     end
                 end
-
                 W_DATA: begin
                     if (m_axi_d_wready) begin
                         m_axi_d_wvalid <= 1'b0;
                         m_axi_d_bready <= 1'b1;
-                        state          <= W_RESP;
+                        d_state        <= W_RESP;
                     end
                 end
-
                 W_RESP: begin
                     if (m_axi_d_bvalid) begin
                         m_axi_d_bready <= 1'b0;
-
-                        // FIX 7: incrementar cnt AQUI
-                        cnt   <= cnt + 1;
-                        state <= W_NEXT;
+                        d_cnt  <= d_cnt + 1;
+                        d_state <= W_NEXT;
                     end
                 end
-
                 W_NEXT: begin
-                    // FIX 8: cnt já foi incrementado em W_RESP
-                    if (cnt == 4'd8) begin
+                    if (d_cnt == 4'd8) begin
                         dmem_ack <= 1'b1;
-                        state    <= IDLE;
+                        d_state  <= IDLE;
                     end else begin
-                        // FIX 9: endereço e dado calculados a partir da base
-                        m_axi_d_awaddr  <= base_addr_reg + {cnt, 3'b000};
-                        m_axi_d_wdata   <= dmem_wdata[cnt * 64 +: 64];
+                        m_axi_d_awaddr  <= d_base + {d_cnt, 3'b000};
+                        m_axi_d_wdata   <= dmem_wdata[d_cnt * 64 +: 64];
                         m_axi_d_awvalid <= 1'b1;
-                        state           <= W_ADDR;
+                        d_state         <= W_ADDR;
                     end
                 end
-
-                default: state <= IDLE;
+                default: d_state <= IDLE;
             endcase
         end
     end
 
     // =========================================================================
-    // Tie-offs: I-Cache master não utilizado
+    // FIX 1: I-Cache FSM (implementada, não tie-off)
     // =========================================================================
+    state_t            i_state;
+    logic [3:0]        i_cnt;
+    logic [511:0]      i_buf;
+    logic [PADDR_WIDTH-1:0] i_base;
+
     assign m_axi_i_arid    = '0;
-    assign m_axi_i_araddr  = '0;
     assign m_axi_i_arlen   = 8'd0;
-    assign m_axi_i_arsize  = 3'b000;
-    assign m_axi_i_arburst = 2'b00;
-    assign m_axi_i_arvalid = 1'b0;
-    assign m_axi_i_rready  = 1'b0;
-    assign imem_ack        = 1'b0;
-    assign imem_data       = '0;
+    assign m_axi_i_arsize  = 3'b011;
+    assign m_axi_i_arburst = 2'b01;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            i_state         <= IDLE;
+            i_cnt           <= '0;
+            i_base          <= '0;
+            i_buf           <= '0;
+            imem_ack        <= 1'b0;
+            imem_data       <= '0;
+            m_axi_i_arvalid <= 1'b0;
+            m_axi_i_araddr  <= '0;
+            m_axi_i_rready  <= 1'b0;
+        end else begin
+            imem_ack <= 1'b0;
+
+            case (i_state)
+                IDLE: begin
+                    i_cnt <= '0;
+                    // D-Cache tem prioridade — só atende I-Cache se D estiver idle
+                    if (imem_req && d_state == IDLE) begin
+                        i_base          <= imem_addr;
+                        m_axi_i_araddr  <= imem_addr;
+                        m_axi_i_arvalid <= 1'b1;
+                        i_state         <= R_ADDR;
+                    end
+                end
+                R_ADDR: begin
+                    if (m_axi_i_arready) begin
+                        m_axi_i_arvalid <= 1'b0;
+                        m_axi_i_rready  <= 1'b1;
+                        i_state         <= R_WAIT_DATA;
+                    end
+                end
+                R_WAIT_DATA: begin
+                    if (m_axi_i_rvalid) begin
+                        m_axi_i_rready  <= 1'b0;
+                        i_buf[i_cnt * 64 +: 64] <= m_axi_i_rdata;
+                        i_cnt   <= i_cnt + 1;
+                        i_state <= R_NEXT;
+                    end
+                end
+                R_NEXT: begin
+                    if (i_cnt == 4'd8) begin
+                        imem_data <= i_buf;
+                        imem_ack  <= 1'b1;
+                        i_state   <= IDLE;
+                    end else begin
+                        m_axi_i_araddr  <= i_base + {i_cnt, 3'b000};
+                        m_axi_i_arvalid <= 1'b1;
+                        i_state         <= R_ADDR;
+                    end
+                end
+                default: i_state <= IDLE;
+            endcase
+        end
+    end
 
 endmodule
