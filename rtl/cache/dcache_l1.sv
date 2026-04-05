@@ -9,12 +9,15 @@ import nebula_pkg::*;
  *
  * CORREÇÕES APLICADAS:
  * 1. Todas as declarações "logic" removidas de dentro de always_ff e
- *    always_comb — movidas para sinais de módulo.
+ * always_comb — movidas para sinais de módulo.
  * 2. found_dirty removido do bloco always_comb da FSM e declarado
- *    como sinal de módulo.
- * 3. (novo) *_tmp que eram variáveis locais dentro de always_ff com
- *    blocking assignment movidos para blocos always_comb separados.
- *    Isso elimina os warnings BLKSEQ do Verilator 5.036.
+ * como sinal de módulo.
+ * 3. *_tmp que eram variáveis locais dentro de always_ff com
+ * blocking assignment movidos para blocos always_comb separados.
+ * Isso elimina os warnings BLKSEQ do Verilator 5.036.
+ * 4. BLINDAGEM ANTI-FANTASMA: Proteção no sinal req_ready através do
+ * registo prev_resp_valid para evitar que a Cache processe a mesma
+ * instrução duas vezes devido a 1 ciclo de "eco" do Backend.
  */
 module dcache_l1 #(
     parameter int PADDR_WIDTH = 56,
@@ -53,7 +56,6 @@ module dcache_l1 #(
     input  wire [LINE_SIZE*8-1:0]   mem_rdata,
     input  wire                     mem_error
 );
-
     localparam int OFFSET_BITS = $clog2(LINE_SIZE);
     localparam int INDEX_BITS  = $clog2(NUM_SETS);
     localparam int TAG_BITS    = PADDR_WIDTH - INDEX_BITS - OFFSET_BITS;
@@ -122,22 +124,21 @@ module dcache_l1 #(
 
     // =========================================================================
     // FIX BLKSEQ: cálculos intermediários em always_comb separados
-    // Estes sinais substituem as variáveis locais que estavam em always_ff
     // =========================================================================
 
     // Para S_HIT_PROCESS
-    logic [XLEN-1:0]             hit_new_word;      // apply_wstrb(selected_word, wdata_reg, wstrb_reg)
-    logic [LINE_BITS-1:0]        hit_new_line;      // modify_line(hit_line, hit_new_word, word_offset_reg)
+    logic [XLEN-1:0]             hit_new_word;
+    logic [LINE_BITS-1:0]        hit_new_line;
 
     // Para S_REFILL_DONE
-    logic [XLEN-1:0]             refill_word_from_buf;  // word at word_offset_reg in line_buffer
-    logic [XLEN-1:0]             refill_new_word;        // apply_wstrb(refill_word_from_buf, ...)
-    logic [LINE_BITS-1:0]        refill_new_line;        // final line para escrita
+    logic [XLEN-1:0]             refill_word_from_buf;
+    logic [XLEN-1:0]             refill_new_word;
+    logic [LINE_BITS-1:0]        refill_new_line;
 
     // Para S_AMO_PROCESS
-    logic [XLEN-1:0]             amo_current_word;   // palavra atual (hit ou refill)
-    logic [XLEN-1:0]             amo_result;         // resultado da operação AMO
-    logic [LINE_BITS-1:0]        amo_new_line;       // linha com resultado AMO
+    logic [XLEN-1:0]             amo_current_word;
+    logic [XLEN-1:0]             amo_result;
+    logic [LINE_BITS-1:0]        amo_new_line;
 
     // Para S_FLUSH_SCAN
     logic                        flush_found;
@@ -191,7 +192,7 @@ module dcache_l1 #(
     end
 
     // =========================================================================
-    // FIX: S_HIT_PROCESS — cálculo combinacional
+    // S_HIT_PROCESS — cálculo combinacional
     // =========================================================================
     always_comb begin
         hit_new_word = apply_wstrb(selected_word, wdata_reg, wstrb_reg);
@@ -199,7 +200,7 @@ module dcache_l1 #(
     end
 
     // =========================================================================
-    // FIX: S_REFILL_DONE — cálculo combinacional
+    // S_REFILL_DONE — cálculo combinacional
     // =========================================================================
     always_comb begin
         case (word_offset_reg)
@@ -215,7 +216,6 @@ module dcache_l1 #(
         endcase
 
         refill_new_word = apply_wstrb(refill_word_from_buf, wdata_reg, wstrb_reg);
-
         if (we_reg && !is_amo_reg)
             refill_new_line = modify_line(line_buffer, refill_new_word, word_offset_reg);
         else
@@ -223,13 +223,10 @@ module dcache_l1 #(
     end
 
     // =========================================================================
-    // FIX: S_AMO_PROCESS — cálculo combinacional
+    // S_AMO_PROCESS — cálculo combinacional
     // =========================================================================
     always_comb begin
-        // Selecionar palavra atual — após refill é sempre selected_word
-        // (hit_way_idx_reg aponta para a via correta após S_REFILL_DONE)
         amo_current_word = selected_word;
-
         amo_result   = compute_amo(amo_op_reg, amo_current_word, wdata_reg,
                                    (wstrb_reg == 8'h0F));
         amo_new_line = modify_line(data_array[index_reg][hit_way_idx_reg],
@@ -237,7 +234,7 @@ module dcache_l1 #(
     end
 
     // =========================================================================
-    // FIX: S_FLUSH_SCAN — cálculo combinacional
+    // S_FLUSH_SCAN — cálculo combinacional
     // =========================================================================
     always_comb begin
         flush_found    = 1'b0;
@@ -249,6 +246,7 @@ module dcache_l1 #(
                 if (!flush_found &&
                     tag_array[s][w].valid &&
                     tag_array[s][w].dirty) begin
+    
                     flush_set_next = s[INDEX_BITS-1:0];
                     flush_way_next = w[$clog2(NUM_WAYS)-1:0];
                     flush_found    = 1'b1;
@@ -318,6 +316,7 @@ module dcache_l1 #(
         reg_s  = $signed(reg_val);
         mem_sw = $signed(mem_val[31:0]);
         reg_sw = $signed(reg_val[31:0]);
+
         case (op)
             AMO_SWAP: result = reg_val;
             AMO_ADD:  result = mem_val + reg_val;
@@ -362,6 +361,15 @@ module dcache_l1 #(
         endcase
         return new_plru;
     endfunction
+
+    // =========================================================================
+    // Proteção Anti-Fantasma
+    // =========================================================================
+    logic prev_resp_valid;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) prev_resp_valid <= 1'b0;
+        else        prev_resp_valid <= resp_valid;
+    end
 
     // =========================================================================
     // FSM - Próximo Estado
@@ -467,9 +475,9 @@ module dcache_l1 #(
     end
 
     // =========================================================================
-    // Saídas para Backend
+    // Saídas para Backend e Controle de Eco (Phantom Request)
     // =========================================================================
-    assign req_ready  = (state == S_IDLE) && !flush_all && !flush_addr_valid;
+    assign req_ready  = (state == S_IDLE) && !flush_all && !flush_addr_valid && !prev_resp_valid;
     assign flush_done = (state == S_FLUSH_SCAN) && (next_state == S_IDLE);
 
     always_comb begin
@@ -512,7 +520,6 @@ module dcache_l1 #(
 
     // =========================================================================
     // Lógica Sequencial
-    // Todos os *_tmp são calculados em always_comb acima; aqui só usamos <=
     // =========================================================================
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -555,8 +562,8 @@ module dcache_l1 #(
                 case (state)
                     S_IDLE: begin
                         if (flush_all) begin
-                            flush_set_idx <= '0;
-                            flush_way_idx <= '0;
+                             flush_set_idx <= '0;
+                             flush_way_idx <= '0;
                         end else if (req_valid && req_ready) begin
                             addr_reg        <= req_addr;
                             index_reg       <= req_index;
@@ -578,7 +585,6 @@ module dcache_l1 #(
                             victim_way <= get_plru_victim(plru_bits[index_reg]);
                     end
 
-                    // FIX: sem blocking = — usa sinais comb calculados acima
                     S_HIT_PROCESS: begin
                         if (we_reg) begin
                             data_array[index_reg][hit_way_idx_reg] <= hit_new_line;
@@ -587,7 +593,6 @@ module dcache_l1 #(
                         plru_bits[index_reg] <= update_plru(plru_bits[index_reg], hit_way_idx_reg);
                     end
 
-                    // FIX: AMO usa sinais comb
                     S_AMO_PROCESS: begin
                         data_array[index_reg][hit_way_idx_reg] <= amo_new_line;
                         tag_array[index_reg][hit_way_idx_reg].dirty <= 1'b1;
@@ -599,17 +604,15 @@ module dcache_l1 #(
                             line_buffer <= mem_rdata;
                     end
 
-                    // FIX: REFILL_DONE usa sinais comb
                     S_REFILL_DONE: begin
                         data_array[index_reg][victim_way]       <= refill_new_line;
                         tag_array[index_reg][victim_way].valid  <= 1'b1;
                         tag_array[index_reg][victim_way].dirty  <= we_reg;
                         tag_array[index_reg][victim_way].tag    <= tag_reg;
-                        hit_way_idx_reg                          <= victim_way;
+                        hit_way_idx_reg                         <= victim_way;
                         plru_bits[index_reg] <= update_plru(plru_bits[index_reg], victim_way);
                     end
 
-                    // FIX: FLUSH_SCAN usa sinais comb
                     S_FLUSH_SCAN: begin
                         if (flush_found) begin
                             flush_set_idx <= flush_set_next;

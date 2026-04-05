@@ -38,6 +38,7 @@ module nebula_backend_fpu #(
     input  wire                     frontend_valid,
     input  frontend_packet_t        frontend_in,
     output backend_ctrl_t           backend_ctrl,
+    output logic [7:0]              backend_dmem_wstrb,
     output bp_update_t              bp_update,
 
     output logic                    dcache_req,
@@ -202,33 +203,54 @@ module nebula_backend_fpu #(
     logic [FLEN-1:0] frs1_forwarded, frs2_forwarded, frs3_forwarded;
 
     always_comb begin
-        if (frontend_in.instr0.rs1 == 5'd0) rs1_0_fwd = 64'd0;
-        else if (mem1_int_we && mem1_rd == frontend_in.instr0.rs1) rs1_0_fwd = mem1_result;
-        else if (mem0_int_we && mem0_rd == frontend_in.instr0.rs1) rs1_0_fwd = mem0_result;
-        else rs1_0_fwd = regfile[frontend_in.instr0.rs1];
+        // --- FORWARDING INSTR 0 ---
+        if (frontend_in.instr0.rs1 == 5'd0) 
+            rs1_0_fwd = 64'd0;
+        else if (mem1_int_we && (state != S_IDLE) && mem1_rd == frontend_in.instr0.rs1) 
+            rs1_0_fwd = mem1_result;
+        else if (mem0_int_we && (state != S_IDLE) && mem0_rd == frontend_in.instr0.rs1) 
+            rs1_0_fwd = mem0_result;
+        else 
+            rs1_0_fwd = regfile[frontend_in.instr0.rs1];
 
-        if (frontend_in.instr0.rs2 == 5'd0) rs2_0_fwd = 64'd0;
-        else if (mem1_int_we && mem1_rd == frontend_in.instr0.rs2) rs2_0_fwd = mem1_result;
-        else if (mem0_int_we && mem0_rd == frontend_in.instr0.rs2) rs2_0_fwd = mem0_result;
-        else rs2_0_fwd = regfile[frontend_in.instr0.rs2];
+        if (frontend_in.instr0.rs2 == 5'd0) 
+            rs2_0_fwd = 64'd0;
+        else if (mem1_int_we && (state != S_IDLE) && mem1_rd == frontend_in.instr0.rs2) 
+            rs2_0_fwd = mem1_result;
+        else if (mem0_int_we && (state != S_IDLE) && mem0_rd == frontend_in.instr0.rs2) 
+            rs2_0_fwd = mem0_result;
+        else 
+            rs2_0_fwd = regfile[frontend_in.instr0.rs2];
 
-        if (frontend_in.instr1.rs1 == 5'd0) rs1_1_fwd = 64'd0;
-        else if (mem1_int_we && mem1_rd == frontend_in.instr1.rs1) rs1_1_fwd = mem1_result;
-        else if (mem0_int_we && mem0_rd == frontend_in.instr1.rs1) rs1_0_fwd = mem0_result;
-        else rs1_1_fwd = regfile[frontend_in.instr1.rs1];
+        // --- FORWARDING INSTR 1 ---
+        if (frontend_in.instr1.rs1 == 5'd0) 
+            rs1_1_fwd = 64'd0;
+        else if (mem1_int_we && (state != S_IDLE) && mem1_rd == frontend_in.instr1.rs1) 
+            rs1_1_fwd = mem1_result;
+        else if (mem0_int_we && (state != S_IDLE) && mem0_rd == frontend_in.instr1.rs1) 
+            rs1_1_fwd = mem0_result;
+        else 
+            rs1_1_fwd = regfile[frontend_in.instr1.rs1];
 
-        if (frontend_in.instr1.rs2 == 5'd0) rs2_1_fwd = 64'd0;
-        else if (mem1_int_we && mem1_rd == frontend_in.instr1.rs2) rs2_1_fwd = mem1_result;
-        else if (mem0_int_we && mem0_rd == frontend_in.instr1.rs2) rs2_0_fwd = mem0_result;
-        else rs2_1_fwd = regfile[frontend_in.instr1.rs2];
+        if (frontend_in.instr1.rs2 == 5'd0) 
+            rs2_1_fwd = 64'd0;
+        else if (mem1_int_we && (state != S_IDLE) && mem1_rd == frontend_in.instr1.rs2) 
+            rs2_1_fwd = mem1_result;
+        else if (mem0_int_we && (state != S_IDLE) && mem0_rd == frontend_in.instr1.rs2) 
+            rs2_1_fwd = mem0_result;
+        else 
+            rs2_1_fwd = regfile[frontend_in.instr1.rs2];
 
-        if (mem_fp_we && mem0_rd == frontend_in.instr0.rs1) frs1_forwarded = mem_fp_result;
+        if (mem_fp_we && (state != S_IDLE) && mem0_rd == frontend_in.instr0.rs1) 
+            frs1_forwarded = mem_fp_result;
         else frs1_forwarded = fpregfile[frontend_in.instr0.rs1];
-
-        if (mem_fp_we && mem0_rd == frontend_in.instr0.rs2) frs2_forwarded = mem_fp_result;
+        
+        if (mem_fp_we && (state != S_IDLE) && mem0_rd == frontend_in.instr0.rs2) 
+            frs2_forwarded = mem_fp_result;
         else frs2_forwarded = fpregfile[frontend_in.instr0.rs2];
-
-        if (mem_fp_we && mem0_rd == frontend_in.instr0.rs3) frs3_forwarded = mem_fp_result;
+        
+        if (mem_fp_we && (state != S_IDLE) && mem0_rd == frontend_in.instr0.rs3) 
+            frs3_forwarded = mem_fp_result;
         else frs3_forwarded = fpregfile[frontend_in.instr0.rs3];
     end
 
@@ -516,6 +538,33 @@ module nebula_backend_fpu #(
         endcase
     end
 
+    // ------------------------------------------------------------------------
+    // Geração de Write Strobe (Máscara de Bytes)
+    // ------------------------------------------------------------------------
+    logic [7:0] dmem_wstrb;
+    logic [2:0] mem_funct3;
+    
+    // Descobre qual instrução está indo para a memória
+    assign mem_funct3 = mem_is_instr1 ? issue_instr1.funct3 : issue_instr0.funct3;
+
+    always_comb begin
+        dmem_wstrb = 8'h00;
+        
+        // Se for um Store, geramos a máscara baseada no funct3 (tamanho)
+        if ((!mem_is_instr1 && issue_instr0.is_store) || 
+            ( mem_is_instr1 && issue_instr1.is_store)) begin
+            
+            case (mem_funct3[1:0])
+                2'b00: dmem_wstrb = 8'h01; // SB (1 byte)
+                2'b01: dmem_wstrb = 8'h03; // SH (2 bytes)
+                2'b10: dmem_wstrb = 8'h0F; // SW (4 bytes)
+                2'b11: dmem_wstrb = 8'hFF; // SD (8 bytes)
+            endcase
+            
+            dmem_wstrb = dmem_wstrb << exec_mem_addr[2:0];
+        end
+    end
+
     // =========================================================================
     // Output Signals
     // =========================================================================
@@ -712,20 +761,18 @@ module nebula_backend_fpu #(
                     exec_branch_target <= branch_target;
 
                     if (issue_valid1 && is_mem1) begin
-                        exec_mem_addr   <= issue1_rs1_data[VADDR_WIDTH-1:0] +
-                                           issue_instr1.imm[VADDR_WIDTH-1:0];
+                        exec_mem_addr   <= mem_vaddr;
                         exec_store_data <= issue1_rs2_data;
                         mem_is_instr1   <= 1'b1;
                     end else begin
-                        exec_mem_addr      <= issue0_rs1_data[VADDR_WIDTH-1:0] +
-                                              issue_instr0.imm[VADDR_WIDTH-1:0];
+                        exec_mem_addr      <= mem_vaddr;
                         exec_store_data    <= issue0_rs2_data;
                         exec_fp_store_data <= issue0_frs2_data;
                         mem_is_instr1      <= 1'b0;
                     end
 
                     if (!mmu_enabled)
-                        dcache_addr <= {{(PADDR_WIDTH-VADDR_WIDTH){1'b0}}, exec_mem_addr};
+                        dcache_addr <= {{(PADDR_WIDTH-VADDR_WIDTH){1'b0}}, mem_vaddr};
 
                     // Traps (instr0 apenas — instr1 só é ALU, sem traps)
                     if (issue_instr0.is_ecall) begin
@@ -826,55 +873,61 @@ module nebula_backend_fpu #(
                 end
 
                 S_WRITEBACK: begin
-                    // Writeback instr0
-                    if (issue_instr0.rd != 5'd0) begin
-                        if (issue_instr0.is_alu || issue_instr0.is_jal || issue_instr0.is_jalr ||
-                            issue_instr0.is_csr || issue_instr0.is_mdu) begin
-                            regfile[issue_instr0.rd] <= exec_result0;
-                            mem0_result <= exec_result0;
-                            mem0_rd     <= issue_instr0.rd;
-                            mem0_int_we <= 1'b1;
-                        end else if (!mem_is_instr1 && (issue_instr0.is_load || issue_instr0.is_amo)) begin
+                    if (!mem_is_instr1) begin
+                        
+                        // 1. Gravar a Instr 0 (Load/AMO ou ALU)
+                        if (issue_instr0.is_load || issue_instr0.is_amo) begin
                             regfile[issue_instr0.rd] <= mem0_result;
                             mem0_rd     <= issue_instr0.rd;
                             mem0_int_we <= 1'b1;
-                        end else if (issue_instr0.is_fp &&
-                                    (decoded_fpu_op inside {FPU_CMP_EQ, FPU_CMP_LT, FPU_CMP_LE,
-                                                            FPU_CVT_W, FPU_CVT_WU, FPU_CVT_L, FPU_CVT_LU,
-                                                            FPU_CLASS, FPU_MV_X_W})) begin
+                        // Regra de Ouro: Não gravar Stores nem Branches!
+                        end else if (issue_instr0.rd != 5'd0 && !issue_instr0.is_store && !issue_instr0.is_branch) begin
                             regfile[issue_instr0.rd] <= exec_result0;
-                            mem0_result <= exec_result0;
                             mem0_rd     <= issue_instr0.rd;
                             mem0_int_we <= 1'b1;
                         end
-                    end
-
-                    // Writeback instr1 (dual-issue)
-                    if (issue_valid1 && issue_instr1.rd != 5'd0) begin
-                        if (issue_instr1.is_alu || issue_instr1.is_jal || issue_instr1.is_jalr) begin
-                            regfile[issue_instr1.rd] <= exec_result1;
-                            mem1_result <= exec_result1;
+                        
+                        // 2. Gravar a Instr 1 (ALU, etc) <- FOI ISTO QUE EU TINHA APAGADO!
+                        if (issue_valid1) begin
+                            if (issue_instr1.rd != 5'd0 && !issue_instr1.is_store && !issue_instr1.is_branch) begin
+                                regfile[issue_instr1.rd] <= exec_result1;
+                                mem1_rd     <= issue_instr1.rd;
+                                mem1_int_we <= 1'b1;
+                            end
+                        end
+                    end else begin
+                        
+                        // 1. Gravar a Instr 0 (ALU, etc)
+                        if (issue_instr0.rd != 5'd0 && !issue_instr0.is_store && !issue_instr0.is_branch) begin
+                            regfile[issue_instr0.rd] <= exec_result0;
+                            mem0_rd     <= issue_instr0.rd;
+                            mem0_int_we <= 1'b1;
+                        end
+                        
+                        // 2. Gravar a Instr 1 (Load/AMO ou ALU falhada)
+                        if (issue_instr1.is_load || issue_instr1.is_amo) begin
+                            regfile[issue_instr1.rd] <= mem1_result;
                             mem1_rd     <= issue_instr1.rd;
                             mem1_int_we <= 1'b1;
-                        end else if (mem_is_instr1 && (issue_instr1.is_load || issue_instr1.is_amo)) begin
-                            regfile[issue_instr1.rd] <= mem1_result;
+                        end else if (issue_instr1.rd != 5'd0 && !issue_instr1.is_store && !issue_instr1.is_branch) begin
+                            regfile[issue_instr1.rd] <= exec_result1;
                             mem1_rd     <= issue_instr1.rd;
                             mem1_int_we <= 1'b1;
                         end
                     end
 
-                    // FP writeback (instr0 apenas)
+                    // FP writeback (mantém-se inalterado)
                     if (issue_instr0.is_fp_load) begin
                         fpregfile[issue_instr0.rd] <= mem_fp_result;
                         mem0_rd    <= issue_instr0.rd;
-                        mem_fp_we <= 1'b1;
+                        mem_fp_we  <= 1'b1;
                     end else if (issue_instr0.is_fp &&
                                 !(decoded_fpu_op inside {FPU_CMP_EQ, FPU_CMP_LT, FPU_CMP_LE,
                                                          FPU_CVT_W, FPU_CVT_WU, FPU_CVT_L, FPU_CVT_LU,
                                                          FPU_CLASS, FPU_MV_X_W})) begin
                         fpregfile[issue_instr0.rd] <= exec_fp_result;
                         mem_fp_result <= exec_fp_result;
-                        mem0_rd        <= issue_instr0.rd;
+                        mem0_rd       <= issue_instr0.rd;
                         mem_fp_we     <= 1'b1;
                     end
                 end

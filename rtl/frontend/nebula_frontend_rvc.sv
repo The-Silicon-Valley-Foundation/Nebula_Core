@@ -7,18 +7,6 @@ import nebula_pkg::*;
  * @module nebula_frontend_rvc
  * @brief Frontend Dual Issue com suporte completo a RV64C
  *
- * CORREÇÕES APLICADAS:
- * 1. fetch_buffer_valid alargado para 5 bits [4:0] — o bit [4] cobre
- *    o halfword extra em fetch_buffer[79:64] que é necessário para
- *    instruções de 32 bits cruzando o limite de 64 bytes (offset=2'b11).
- *    Antes era 4 bits e fetch_buffer_valid[4] era lido como 0 sempre.
- *
- * 2. Lógica have_full_instr para offset 2'b11 corrigida:
- *    - Antes: verificava fetch_buffer[79:64] != 0 (conteúdo, não validade)
- *    - Depois: verifica fetch_buffer_valid[4] (bit de validade correto)
- *
- * 3. consumed_halfwords e atualização de fetch_buffer_valid corrigidos
- *    para lidar com o bit [4] quando offset=2'b11.
  */
 module nebula_frontend_rvc #(
     parameter int XLEN        = 64,
@@ -69,7 +57,6 @@ module nebula_frontend_rvc #(
     output logic [5:0]              fetch_exception_cause,
     output logic [XLEN-1:0]         fetch_exception_value
 );
-
     localparam logic [VADDR_WIDTH-1:0] RESET_VECTOR = 39'h00_1000_0000;
 
     logic [79:0] fetch_buffer;
@@ -156,6 +143,7 @@ module nebula_frontend_rvc #(
         .cinstr(i0_raw[15:0]), .instr(i0_expanded),
         .valid(i0_c_valid), .illegal(i0_illegal), .is_compressed()
     );
+
     compressed_decoder_rv64 u_decomp1 (
         .cinstr(i1_raw[15:0]), .instr(i1_expanded),
         .valid(i1_c_valid), .illegal(i1_illegal), .is_compressed()
@@ -244,7 +232,8 @@ module nebula_frontend_rvc #(
                 dec.is_fp_store = 1'b1; dec.is_fp = 1'b1;
             end
             7'b1000011, 7'b1000111, 7'b1001011, 7'b1001111: begin
-                dec.is_fp        = 1'b1; dec.is_fma = 1'b1;
+                dec.is_fp        = 1'b1;
+                dec.is_fma = 1'b1;
                 dec.is_fp_single = (instr_bits[26:25] == 2'b00);
                 dec.is_fp_double = (instr_bits[26:25] == 2'b01);
                 dec.rm           = rounding_mode_t'(instr_bits[14:12]);
@@ -278,22 +267,21 @@ module nebula_frontend_rvc #(
             instr_bits[14:12] == 3'b000 &&
             instr_bits[6:0]   == 7'b1110011)
             dec.is_sfence_vma = 1'b1;
-
         return dec;
     endfunction
 
     // =========================================================================
-    // Dual Issue Hazard Unit
+    // Dual Issue Hazard Unit & Scoreboard (Padrão Indústria)
     // =========================================================================
     decoded_instr_t decoded_instr0, decoded_instr1;
     logic can_dual_issue;
+    logic hazard_detected;
 
     typedef enum logic [3:0] {
         S_RESET, S_FETCH_REQ, S_TLB_LOOKUP, S_TLB_WAIT,
         S_ICACHE_REQ, S_ICACHE_WAIT, S_PROCESS, S_DECODE,
         S_STALL, S_FLUSH, S_EXCEPTION
     } state_t;
-
     state_t state, next_state;
     logic [PPN_WIDTH-1:0] cached_ppn;
     logic                 tlb_done;
@@ -308,30 +296,74 @@ module nebula_frontend_rvc #(
         if (!i0_have_full || state != S_DECODE) decoded_instr0.valid = 1'b0;
         if (!i1_have_full || state != S_DECODE) decoded_instr1.valid = 1'b0;
 
-        can_dual_issue = 1'b1;
-        if (!decoded_instr1.valid)                     can_dual_issue = 1'b0;
-        if (!decoded_instr1.is_alu || decoded_instr1.is_mdu) can_dual_issue = 1'b0;
-        if (decoded_instr0.is_ecall || decoded_instr0.is_ebreak ||
-            decoded_instr0.is_mret || decoded_instr0.is_branch ||
-            decoded_instr0.is_load || decoded_instr0.is_store ||
-            decoded_instr0.is_mdu  || decoded_instr0.is_fp)
-            can_dual_issue = 1'b0;
-
-        if (decoded_instr0.rd != 5'd0) begin
-            if ((decoded_instr1.rs1 == decoded_instr0.rd) ||
-                (decoded_instr1.rs2 == decoded_instr0.rd) ||
-                (decoded_instr1.rs3 == decoded_instr0.rd))
-                can_dual_issue = 1'b0;
-            if (decoded_instr1.rd == decoded_instr0.rd)
-                can_dual_issue = 1'b0;
+        hazard_detected = 1'b0;
+        
+        // Só avaliamos hazards se ambas as instruções forem válidas no buffer
+        if (decoded_instr0.valid && decoded_instr1.valid) begin
+        
+            // 1. RAW Hazard (Read-After-Write)
+            if (decoded_instr0.rd != 5'd0) begin
+                // Dependência no rs1
+                if (decoded_instr1.rs1 == decoded_instr0.rd) 
+                    hazard_detected = 1'b1;
+                
+                // Dependência no rs2 (Apenas para instruções que usam rs2)
+                if (decoded_instr1.is_store || decoded_instr1.is_branch || decoded_instr1.is_amo || 
+                   (decoded_instr1.is_alu && decoded_instr1.opcode[5] == 1'b1) || decoded_instr1.is_mdu) begin
+                    if (decoded_instr1.rs2 == decoded_instr0.rd) 
+                        hazard_detected = 1'b1;
+                end
+            end
+            
+            // 2. WAW Hazard (Write-After-Write)
+            if (decoded_instr1.rd == decoded_instr0.rd && decoded_instr1.rd != 5'd0) begin
+                hazard_detected = 1'b1;
+            end
+            
+            // 3. Conflito Estrutural de Memória (Só temos 1 D-Cache Port)
+            if ((decoded_instr0.is_load || decoded_instr0.is_store || decoded_instr0.is_amo) &&
+                (decoded_instr1.is_load || decoded_instr1.is_store || decoded_instr1.is_amo)) begin
+                hazard_detected = 1'b1;
+            end
         end
     end
 
+    // O Dual Issue só acontece se não houver hazards e a instr1 for simples
     always_comb begin
-        if (can_dual_issue)
-            next_pc = instr1_pc + (i1_is_compressed ? 2 : 4);
-        else
-            next_pc = instr1_pc;
+        can_dual_issue = 1'b1;
+        if (hazard_detected) can_dual_issue = 1'b0;
+        if (!decoded_instr1.valid) can_dual_issue = 1'b0;
+        if (!(decoded_instr1.is_alu || decoded_instr1.is_store)) can_dual_issue = 1'b0;
+        if (decoded_instr0.is_ecall || decoded_instr0.is_ebreak || decoded_instr0.is_mret || 
+            decoded_instr0.is_branch || decoded_instr0.is_load || decoded_instr0.is_store ||
+            decoded_instr0.is_amo || decoded_instr0.is_mdu || decoded_instr0.is_fp) begin
+            can_dual_issue = 1'b0;
+        end
+    end
+
+    // =========================================================================
+    // INSTRUCTION QUEUE POINTERS (Evitar Desalinhamento / Misalignment)
+    // =========================================================================
+    logic [2:0] consumed_halfwords;
+    logic [2:0] hw_len0, hw_len1;
+    assign hw_len0 = i0_is_compressed ? 3'd1 : 3'd2;
+    assign hw_len1 = i1_is_compressed ? 3'd1 : 3'd2;
+
+    always_comb begin
+        consumed_halfwords = 3'd0;
+        next_pc = pc_reg;
+
+        if (frontend_valid) begin 
+            if (can_dual_issue && decoded_instr1.valid) begin
+                // DESPACHO DUPLO: Consome ambas as instruções do buffer
+                consumed_halfwords = hw_len0 + hw_len1;
+                next_pc = pc_reg + (hw_len0 * 2) + (hw_len1 * 2);
+            end else if (decoded_instr0.valid) begin
+                // ISSUE STALL: Despacha apenas a instr0. A instr1 fica retida no buffer!
+                consumed_halfwords = hw_len0;
+                next_pc = pc_reg + (hw_len0 * 2);
+            end
+        end
         fetch_pc = {pc_reg[VADDR_WIDTH-1:3], 3'b000};
     end
 
@@ -388,18 +420,8 @@ module nebula_frontend_rvc #(
 
     assign fetch_exception       = (state == S_EXCEPTION);
     assign fetch_exception_cause = (itlb_page_fault || ptw_page_fault) ?
-                                   6'(EXC_INSTR_PAGE_FAULT) : 6'(EXC_INSTR_ACCESS_FAULT);
+        6'(EXC_INSTR_PAGE_FAULT) : 6'(EXC_INSTR_ACCESS_FAULT);
     assign fetch_exception_value = {{(XLEN-VADDR_WIDTH){pc_reg[VADDR_WIDTH-1]}}, pc_reg};
-
-    // consumed_halfwords para atualização do buffer
-    logic [2:0] consumed_halfwords;
-    always_comb begin
-        consumed_halfwords = 0;
-        if (frontend_valid) begin
-            consumed_halfwords = (i0_is_compressed ? 3'd1 : 3'd2) +
-                                 (can_dual_issue ? (i1_is_compressed ? 3'd1 : 3'd2) : 3'd0);
-        end
-    end
 
     // Controle de Latch de retenção
     logic flush_pending;
@@ -412,14 +434,14 @@ module nebula_frontend_rvc #(
             pc_reg             <= RESET_VECTOR;
             flush_pc_latched   <= RESET_VECTOR;
             fetch_buffer       <= '0;
-            fetch_buffer_valid <= '0;  // agora 5 bits
+            fetch_buffer_valid <= '0;
+            // agora 5 bits
             fetch_offset       <= '0;
             cached_ppn         <= '0;
             tlb_done           <= 1'b0;
             flush_pending      <= 1'b0; 
         end else begin
             state <= next_state;
-
             if (backend_redirect) begin
                 flush_pending    <= 1'b1;
                 flush_pc_latched <= backend_redirect_pc;
@@ -447,8 +469,7 @@ module nebula_frontend_rvc #(
 
                 S_ICACHE_WAIT: begin
                     if (icache_resp_valid && !icache_resp_error) begin
-                        // Se offset[2] estava setado,
-                        // preserva [79:64] como o halfword extra da linha anterior
+                        // Se offset[2] estava setado, preserva [79:64] como o halfword extra da linha anterior
                         if (fetch_offset[2])
                             fetch_buffer[79:64] <= fetch_buffer[63:48];
                         fetch_buffer[63:0]  <= icache_resp_data;
@@ -484,7 +505,6 @@ module nebula_frontend_rvc #(
                         pc_reg <= backend_redirect_pc;
                     else if (flush_pending) 
                         pc_reg <= flush_pc_latched;
-                    
                     fetch_buffer       <= '0;
                     fetch_buffer_valid <= '0;
                     fetch_offset       <= '0;
