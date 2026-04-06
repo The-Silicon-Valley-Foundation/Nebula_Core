@@ -1,2 +1,0 @@
-#!/bin/sh
-cmake -G Ninja -DTESTS=ON --toolchain "$(dirname $0)/../cmake/TC-thumbv6m.cmake" "$(dirname $0)/.." "$@"

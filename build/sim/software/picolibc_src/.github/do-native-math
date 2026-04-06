@@ -1,4 +1,0 @@
-#!/bin/sh
-set -e
-HERE=`dirname "$0"`
-"$HERE"/do-test-noopt native -Dexhaustive-math-tests=true "$@"
