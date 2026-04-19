@@ -7,6 +7,16 @@ import nebula_pkg::*;
  * @module nebula_frontend_rvc
  * @brief Frontend Dual Issue com suporte completo a RV64C
  *
+ * CORREÇÕES APLICADAS:
+ * 1. [FIX BOOT] reset_hold: contador de 15 ciclos que mantém o frontend
+ *    em S_RESET após o deassert do rst_n. Sem isso, o frontend disparava
+ *    a primeira requisição de I-Cache antes do barramento AXI estar
+ *    estabilizado no simulador LiteX, resultando em leitura espúria em
+ *    endereço inválido antes mesmo da ROM estar pronta.
+ *
+ * 2. fetch_buffer_valid ampliado para 5 bits (bit[4] cobre os 16 bits
+ *    extras do fetch_buffer[79:64] para instruções comprimidas na fronteira
+ *    de linha de cache).
  */
 module nebula_frontend_rvc #(
     parameter int XLEN        = 64,
@@ -57,10 +67,26 @@ module nebula_frontend_rvc #(
     output logic [5:0]              fetch_exception_cause,
     output logic [XLEN-1:0]         fetch_exception_value
 );
-    localparam logic [VADDR_WIDTH-1:0] RESET_VECTOR = 39'h00_1000_0000;
+    localparam logic [VADDR_WIDTH-1:0] RESET_VECTOR = 39'h1000_0000;
+
+    // =========================================================================
+    // FIX 1: Contador de reset para estabilização do barramento AXI
+    // O frontend permanece em S_RESET por RESET_HOLD_CYCLES ciclos após
+    // o deassert de rst_n, garantindo que o simulador LiteX e o AXI
+    // adapter tenham tempo de inicializar antes da primeira requisição.
+    // =========================================================================
+    localparam int RESET_HOLD_CYCLES = 15;
+    logic [4:0] reset_hold_cnt;
+    wire        reset_hold_done = (reset_hold_cnt == 4'(RESET_HOLD_CYCLES));
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            reset_hold_cnt <= '0;
+        else if (!reset_hold_done)
+            reset_hold_cnt <= reset_hold_cnt + 1;
+    end
 
     logic [79:0] fetch_buffer;
-    // FIX 1: 5 bits — bit[4] cobre fetch_buffer[79:64]
     logic [4:0]  fetch_buffer_valid;
     logic [2:0]  fetch_offset;
 
@@ -275,7 +301,7 @@ module nebula_frontend_rvc #(
     endfunction
 
     // =========================================================================
-    // Dual Issue Hazard Unit & Scoreboard (Padrão Indústria)
+    // Dual Issue Hazard Unit & Scoreboard
     // =========================================================================
     decoded_instr_t decoded_instr0, decoded_instr1;
     logic can_dual_issue;
@@ -286,7 +312,7 @@ module nebula_frontend_rvc #(
         S_ICACHE_REQ, S_ICACHE_WAIT, S_PROCESS, S_DECODE,
         S_STALL, S_FLUSH, S_EXCEPTION
     } state_t;
-    
+
     state_t state, next_state;
     logic [PPN_WIDTH-1:0] cached_ppn;
     logic                 tlb_done;
@@ -302,56 +328,44 @@ module nebula_frontend_rvc #(
         if (!i1_have_full || state != S_DECODE) decoded_instr1.valid = 1'b0;
 
         hazard_detected = 1'b0;
-        
-        // Só avaliamos hazards se ambas as instruções forem válidas no buffer
+
         if (decoded_instr0.valid && decoded_instr1.valid) begin
-        
-            // 1. RAW Hazard (Read-After-Write)
+            // RAW Hazard
             if (decoded_instr0.rd != 5'd0) begin
-                // Dependência no rs1
-                if (decoded_instr1.rs1 == decoded_instr0.rd) 
+                if (decoded_instr1.rs1 == decoded_instr0.rd)
                     hazard_detected = 1'b1;
-                
-                // Dependência no rs2 (Apenas para instruções que usam rs2)
-                if (decoded_instr1.is_store || decoded_instr1.is_branch || decoded_instr1.is_amo || 
+                if (decoded_instr1.is_store || decoded_instr1.is_branch || decoded_instr1.is_amo ||
                    (decoded_instr1.is_alu && decoded_instr1.opcode[5] == 1'b1) || decoded_instr1.is_mdu) begin
-                    if (decoded_instr1.rs2 == decoded_instr0.rd) 
+                    if (decoded_instr1.rs2 == decoded_instr0.rd)
                         hazard_detected = 1'b1;
                 end
             end
-            
-            // 2. WAW Hazard (Write-After-Write)
-            if (decoded_instr1.rd == decoded_instr0.rd && decoded_instr1.rd != 5'd0) begin
+            // WAW Hazard
+            if (decoded_instr1.rd == decoded_instr0.rd && decoded_instr1.rd != 5'd0)
                 hazard_detected = 1'b1;
-            end
-            
-            // 3. Conflito Estrutural de Memória (Só temos 1 D-Cache Port)
+            // Conflito estrutural de memória
             if ((decoded_instr0.is_load || decoded_instr0.is_store || decoded_instr0.is_amo) &&
-                (decoded_instr1.is_load || decoded_instr1.is_store || decoded_instr1.is_amo)) begin
+                (decoded_instr1.is_load || decoded_instr1.is_store || decoded_instr1.is_amo))
                 hazard_detected = 1'b1;
-            end
         end
     end
 
-    // O Dual Issue só acontece se não houver hazards e a instr1 for simples
     always_comb begin
         can_dual_issue = 1'b1;
         if (hazard_detected) can_dual_issue = 1'b0;
         if (!decoded_instr1.valid) can_dual_issue = 1'b0;
         if (!(decoded_instr1.is_alu || decoded_instr1.is_store)) can_dual_issue = 1'b0;
         if (decoded_instr0.is_branch || decoded_instr0.is_jal || decoded_instr0.is_jalr ||
-            decoded_instr1.is_branch || decoded_instr1.is_jal || decoded_instr1.is_jalr) begin
+            decoded_instr1.is_branch || decoded_instr1.is_jal || decoded_instr1.is_jalr)
             can_dual_issue = 1'b0;
-        end
-        if (decoded_instr0.is_ecall || decoded_instr0.is_ebreak || decoded_instr0.is_mret || 
-            decoded_instr0.is_load || decoded_instr0.is_store ||
-            decoded_instr0.is_amo || decoded_instr0.is_mdu || decoded_instr0.is_fp) begin
+        if (decoded_instr0.is_ecall || decoded_instr0.is_ebreak || decoded_instr0.is_mret ||
+            decoded_instr0.is_load  || decoded_instr0.is_store  ||
+            decoded_instr0.is_amo   || decoded_instr0.is_mdu    || decoded_instr0.is_fp)
             can_dual_issue = 1'b0;
-        end
     end
 
     // =========================================================================
-    // INSTRUCTION QUEUE POINTERS (Evitar Desalinhamento / Misalignment)
+    // Ponteiros de consumo de halfwords
     // =========================================================================
     logic [2:0] consumed_halfwords;
     logic [2:0] hw_len0, hw_len1;
@@ -362,13 +376,11 @@ module nebula_frontend_rvc #(
         consumed_halfwords = 3'd0;
         next_pc = pc_reg;
 
-        if (frontend_valid) begin 
+        if (frontend_valid) begin
             if (can_dual_issue && decoded_instr1.valid) begin
-                // DESPACHO DUPLO: Usa o instr0_pc corrigido como base
                 consumed_halfwords = hw_len0 + hw_len1;
                 next_pc = instr0_pc + (hw_len0 * 2) + (hw_len1 * 2);
             end else if (decoded_instr0.valid) begin
-                // ISSUE STALL: Usa o instr0_pc corrigido como base
                 consumed_halfwords = hw_len0;
                 next_pc = instr0_pc + (hw_len0 * 2);
             end
@@ -376,47 +388,48 @@ module nebula_frontend_rvc #(
         fetch_pc = {pc_reg[VADDR_WIDTH-1:3], 3'b000};
     end
 
-    // FSM
+    // =========================================================================
+    // FSM — S_RESET aguarda reset_hold_done antes de avançar
+    // =========================================================================
     always_comb begin
         next_state = state;
         case (state)
-            S_RESET:       next_state = S_FETCH_REQ;
-            
-            S_FETCH_REQ:   next_state = backend_flush ? S_FLUSH :
-                                        (mmu_enabled ? S_TLB_LOOKUP : S_ICACHE_REQ);
-                                        
-            S_TLB_LOOKUP:  next_state = backend_flush    ? S_FLUSH :
-                                        itlb_page_fault  ? S_EXCEPTION :
-                                        itlb_hit         ? S_ICACHE_REQ :
-                                        ptw_ready        ? S_TLB_WAIT : S_TLB_LOOKUP;
-                                        
-            S_TLB_WAIT:    next_state = backend_flush  ? S_FLUSH :
-                                        ptw_resp_valid ? (ptw_page_fault ? S_EXCEPTION : S_TLB_LOOKUP)
-                                                       : S_TLB_WAIT;
-                                                       
-            S_ICACHE_REQ:  next_state = backend_flush ? S_FLUSH :
-                                        icache_ready  ? S_ICACHE_WAIT : S_ICACHE_REQ;
-                                    
+            // FIX 1: aguardar reset_hold_done para estabilização do AXI
+            S_RESET: next_state = reset_hold_done ? S_FETCH_REQ : S_RESET;
+
+            S_FETCH_REQ: next_state = backend_flush ? S_FLUSH :
+                                      (mmu_enabled ? S_TLB_LOOKUP : S_ICACHE_REQ);
+
+            S_TLB_LOOKUP: next_state = backend_flush   ? S_FLUSH :
+                                       itlb_page_fault  ? S_EXCEPTION :
+                                       itlb_hit         ? S_ICACHE_REQ :
+                                       ptw_ready        ? S_TLB_WAIT : S_TLB_LOOKUP;
+
+            S_TLB_WAIT: next_state = backend_flush  ? S_FLUSH :
+                                     ptw_resp_valid ? (ptw_page_fault ? S_EXCEPTION : S_TLB_LOOKUP)
+                                                    : S_TLB_WAIT;
+
+            S_ICACHE_REQ: next_state = backend_flush ? S_FLUSH :
+                                       icache_ready  ? S_ICACHE_WAIT : S_ICACHE_REQ;
+
             S_ICACHE_WAIT: next_state = backend_flush     ? S_FLUSH :
                                         icache_resp_valid ? (icache_resp_error ? S_EXCEPTION : S_DECODE)
                                                           : S_ICACHE_WAIT;
-            
-            S_PROCESS:     next_state = backend_flush ? S_FLUSH : S_FETCH_REQ;
-            
-            S_DECODE:      next_state = backend_flush  ? S_FLUSH :
-                                        backend_redirect ? S_FETCH_REQ :
-                                        backend_stall  ? S_STALL :
-                                        i0_have_full   ? S_DECODE : 
-                                        val0           ? S_PROCESS : S_FETCH_REQ;
-                                        
-            S_STALL:       next_state = backend_flush  ? S_FLUSH :
-                                        !backend_stall ? S_DECODE : S_STALL;
-                                        
-            S_FLUSH:       next_state = S_FETCH_REQ;
-            
-            S_EXCEPTION:   next_state = backend_flush ? S_FLUSH : S_EXCEPTION;
-            
-            default:       next_state = S_RESET;
+
+            S_PROCESS: next_state = backend_flush ? S_FLUSH : S_FETCH_REQ;
+
+            S_DECODE: next_state = backend_flush   ? S_FLUSH :
+                                   backend_redirect ? S_FETCH_REQ :
+                                   backend_stall   ? S_STALL :
+                                   i0_have_full    ? S_DECODE :
+                                   val0            ? S_PROCESS : S_FETCH_REQ;
+
+            S_STALL: next_state = backend_flush  ? S_FLUSH :
+                                  !backend_stall ? S_DECODE : S_STALL;
+
+            S_FLUSH:     next_state = S_FETCH_REQ;
+            S_EXCEPTION: next_state = backend_flush ? S_FLUSH : S_EXCEPTION;
+            default:     next_state = S_RESET;
         endcase
     end
 
@@ -444,11 +457,9 @@ module nebula_frontend_rvc #(
         6'(EXC_INSTR_PAGE_FAULT) : 6'(EXC_INSTR_ACCESS_FAULT);
     assign fetch_exception_value = {{(XLEN-VADDR_WIDTH){pc_reg[VADDR_WIDTH-1]}}, pc_reg};
 
-    // Controle de Latch de retenção
     logic flush_pending;
     logic [VADDR_WIDTH-1:0] flush_pc_latched;
 
-    // Sequential
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state              <= S_RESET;
@@ -456,20 +467,22 @@ module nebula_frontend_rvc #(
             flush_pc_latched   <= RESET_VECTOR;
             fetch_buffer       <= '0;
             fetch_buffer_valid <= '0;
-            // agora 5 bits
             fetch_offset       <= '0;
             cached_ppn         <= '0;
             tlb_done           <= 1'b0;
-            flush_pending      <= 1'b0; 
+            flush_pending      <= 1'b0;
         end else begin
             state <= next_state;
+
             if (backend_redirect) begin
                 flush_pending    <= 1'b1;
                 flush_pc_latched <= backend_redirect_pc;
             end else if (state == S_FLUSH) begin
-                flush_pending    <= 1'b0;
+                flush_pending <= 1'b0;
             end
+
             case (state)
+                // FIX 1: em S_RESET apenas mantemos o PC — sem disparar fetch
                 S_RESET: begin
                     pc_reg             <= RESET_VECTOR;
                     fetch_buffer       <= '0;
@@ -502,10 +515,9 @@ module nebula_frontend_rvc #(
                 end
 
                 S_PROCESS: begin
-                    // Retém a halfword isolada e avança para a próxima linha de cache
                     if (!i0_have_full && !backend_flush) begin
-                        pc_reg          <= pc_reg + 2; 
-                        fetch_offset[2] <= 1'b1;       
+                        pc_reg          <= pc_reg + 2;
+                        fetch_offset[2] <= 1'b1;
                     end
                 end
 
@@ -517,16 +529,13 @@ module nebula_frontend_rvc #(
                             fetch_offset       <= '0;
                         end else begin
                             pc_reg <= next_pc;
-                            
-                            // Consumo da instrução mista limpa a flag de fronteira
+
                             if (fetch_offset[2]) begin
                                 fetch_offset <= {1'b0, (fetch_offset[1:0] + consumed_halfwords[1:0] - 2'd1) & 2'b11};
                             end else begin
-                                // Truncamento matemático rigoroso impede que o bit 2 seja ativado por acidente
                                 fetch_offset <= {1'b0, (fetch_offset[1:0] + consumed_halfwords[1:0]) & 2'b11};
                             end
 
-                            // Limpar bits de validade consumidos
                             for (int i = 0; i < 5; i++) begin
                                 if (fetch_offset[2]) begin
                                     if (i == 4 || i < (int'(fetch_offset[1:0]) + int'(consumed_halfwords) - 1))
@@ -541,9 +550,9 @@ module nebula_frontend_rvc #(
                 end
 
                 S_FLUSH: begin
-                    if (backend_redirect) 
+                    if (backend_redirect)
                         pc_reg <= backend_redirect_pc;
-                    else if (flush_pending) 
+                    else if (flush_pending)
                         pc_reg <= flush_pc_latched;
                     fetch_buffer       <= '0;
                     fetch_buffer_valid <= '0;

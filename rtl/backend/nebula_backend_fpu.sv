@@ -8,21 +8,24 @@ import nebula_pkg::*;
  * @brief Backend Dual-Issue do Nebula Core com suporte completo a FPU
  *
  * CORREÇÕES APLICADAS:
- * 1. fpu_rm: assign fpu_rm = issue_instr0.rm  — estava faltando, causando
- *    que a FPU sempre usasse RM=000 (RNE) independente da instrução.
+ * 1. fpu_rm: assign fpu_rm = issue_instr0.rm — estava faltando.
  *
  * 2. LUI/AUIPC movidos ANTES do bloco "if (issue_instr0.is_alu_w)" em
- *    alu0_result e alu1_result — evita que a sign-extension de 32 bits
- *    sobrescreva o imediato de 64 bits do LUI/AUIPC.
+ *    alu0_result e alu1_result.
  *
- * 3. dcache_we corrigido para dual-issue: deve verificar tanto instr0
- *    quanto instr1 (via is_mem1).
+ * 3. dcache_we corrigido para dual-issue.
  *
- * 4. exec_result exposto como wire alias de exec_result0 para que o
- *    testbench cocotb possa ler o resultado sem depender de --public-flat-rw.
+ * 4. exec_result exposto como wire alias de exec_result0.
  *
- * 5. Trap PC para dual-issue: quando mem_is_instr1, o trap_pc deve
- *    apontar para o PC da instr1, não da instr0.
+ * 5. Trap PC para dual-issue correto.
+ *
+ * 6. [FIX BOOT] dcache_addr só é atualizado em S_EXECUTE quando a instrução
+ *    em execução é realmente uma instrução de memória (is_load, is_store,
+ *    is_amo, ou is_mem1). Antes, mem_vaddr era calculado com registradores
+ *    não inicializados para instruções ALU, enviando 0x000000 para a cache.
+ *
+ * 7. [FIX BOOT] mem_vaddr protegido: quando não há instrução de memória,
+ *    o cálculo de endereço não é propagado para dcache_addr.
  */
 module nebula_backend_fpu #(
     parameter int XLEN = 64,
@@ -203,52 +206,52 @@ module nebula_backend_fpu #(
 
     always_comb begin
         // --- FORWARDING INSTR 0 ---
-        if (frontend_in.instr0.rs1 == 5'd0) 
+        if (frontend_in.instr0.rs1 == 5'd0)
             rs1_0_fwd = 64'd0;
-        else if (mem1_int_we && (state != S_IDLE) && mem1_rd == frontend_in.instr0.rs1) 
+        else if (mem1_int_we && (state != S_IDLE) && mem1_rd == frontend_in.instr0.rs1)
             rs1_0_fwd = mem1_result;
-        else if (mem0_int_we && (state != S_IDLE) && mem0_rd == frontend_in.instr0.rs1) 
+        else if (mem0_int_we && (state != S_IDLE) && mem0_rd == frontend_in.instr0.rs1)
             rs1_0_fwd = mem0_result;
-        else 
+        else
             rs1_0_fwd = regfile[frontend_in.instr0.rs1];
 
-        if (frontend_in.instr0.rs2 == 5'd0) 
+        if (frontend_in.instr0.rs2 == 5'd0)
             rs2_0_fwd = 64'd0;
-        else if (mem1_int_we && (state != S_IDLE) && mem1_rd == frontend_in.instr0.rs2) 
+        else if (mem1_int_we && (state != S_IDLE) && mem1_rd == frontend_in.instr0.rs2)
             rs2_0_fwd = mem1_result;
-        else if (mem0_int_we && (state != S_IDLE) && mem0_rd == frontend_in.instr0.rs2) 
+        else if (mem0_int_we && (state != S_IDLE) && mem0_rd == frontend_in.instr0.rs2)
             rs2_0_fwd = mem0_result;
-        else 
+        else
             rs2_0_fwd = regfile[frontend_in.instr0.rs2];
 
         // --- FORWARDING INSTR 1 ---
-        if (frontend_in.instr1.rs1 == 5'd0) 
+        if (frontend_in.instr1.rs1 == 5'd0)
             rs1_1_fwd = 64'd0;
-        else if (mem1_int_we && (state != S_IDLE) && mem1_rd == frontend_in.instr1.rs1) 
+        else if (mem1_int_we && (state != S_IDLE) && mem1_rd == frontend_in.instr1.rs1)
             rs1_1_fwd = mem1_result;
-        else if (mem0_int_we && (state != S_IDLE) && mem0_rd == frontend_in.instr1.rs1) 
+        else if (mem0_int_we && (state != S_IDLE) && mem0_rd == frontend_in.instr1.rs1)
             rs1_1_fwd = mem0_result;
-        else 
+        else
             rs1_1_fwd = regfile[frontend_in.instr1.rs1];
 
-        if (frontend_in.instr1.rs2 == 5'd0) 
+        if (frontend_in.instr1.rs2 == 5'd0)
             rs2_1_fwd = 64'd0;
-        else if (mem1_int_we && (state != S_IDLE) && mem1_rd == frontend_in.instr1.rs2) 
+        else if (mem1_int_we && (state != S_IDLE) && mem1_rd == frontend_in.instr1.rs2)
             rs2_1_fwd = mem1_result;
-        else if (mem0_int_we && (state != S_IDLE) && mem0_rd == frontend_in.instr1.rs2) 
+        else if (mem0_int_we && (state != S_IDLE) && mem0_rd == frontend_in.instr1.rs2)
             rs2_1_fwd = mem0_result;
-        else 
+        else
             rs2_1_fwd = regfile[frontend_in.instr1.rs2];
 
-        if (mem_fp_we && (state != S_IDLE) && mem0_rd == frontend_in.instr0.rs1) 
+        if (mem_fp_we && (state != S_IDLE) && mem0_rd == frontend_in.instr0.rs1)
             frs1_forwarded = mem_fp_result;
         else frs1_forwarded = fpregfile[frontend_in.instr0.rs1];
-        
-        if (mem_fp_we && (state != S_IDLE) && mem0_rd == frontend_in.instr0.rs2) 
+
+        if (mem_fp_we && (state != S_IDLE) && mem0_rd == frontend_in.instr0.rs2)
             frs2_forwarded = mem_fp_result;
         else frs2_forwarded = fpregfile[frontend_in.instr0.rs2];
-        
-        if (mem_fp_we && (state != S_IDLE) && mem0_rd == frontend_in.instr0.rs3) 
+
+        if (mem_fp_we && (state != S_IDLE) && mem0_rd == frontend_in.instr0.rs3)
             frs3_forwarded = mem_fp_result;
         else frs3_forwarded = fpregfile[frontend_in.instr0.rs3];
     end
@@ -277,8 +280,6 @@ module nebula_backend_fpu #(
     always_comb begin
         // ---- ALU 0 ----
         alu0_result = '0;
-
-        // FIX 2: LUI/AUIPC ANTES do bloco is_alu_w para não serem sobrescritos
         if (issue_instr0.opcode == 7'b0110111)
             alu0_result = issue_instr0.imm;
         else if (issue_instr0.opcode == 7'b0010111)
@@ -308,7 +309,6 @@ module nebula_backend_fpu #(
                 3'b111: alu0_result = alu0_op1 & alu0_op2;
                 default: alu0_result = '0;
             endcase
-            // Sign-extend para instruções W (só ALU-R/I W, não LUI/AUIPC)
             if (issue_instr0.is_alu_w)
                 alu0_result = {{32{alu0_result[31]}}, alu0_result[31:0]};
         end
@@ -361,7 +361,6 @@ module nebula_backend_fpu #(
         branch_taken  = 1'b0;
         branch_target = issue_instr0.pc + (issue_instr0.is_compressed ? 39'd2 : 39'd4);
 
-        // 1. Verifica se a instrução 0 é um salto
         if (issue_instr0.is_jal) begin
             branch_taken  = 1'b1;
             branch_target = issue_instr0.pc + issue_instr0.imm[VADDR_WIDTH-1:0];
@@ -382,9 +381,7 @@ module nebula_backend_fpu #(
             endcase
             if (branch_taken)
                 branch_target = issue_instr0.pc + issue_instr0.imm[VADDR_WIDTH-1:0];
-        end
-        // 2. Se a instr0 não saltou, avalia o ponto cego: a instrução 1!
-        else if (issue_valid1) begin
+        end else if (issue_valid1) begin
             if (issue_instr1.is_jal) begin
                 branch_taken  = 1'b1;
                 branch_target = issue_instr1.pc + issue_instr1.imm[VADDR_WIDTH-1:0];
@@ -468,6 +465,11 @@ module nebula_backend_fpu #(
     wire is_mem1 = issue_valid1 &&
                    (issue_instr1.is_load || issue_instr1.is_store || issue_instr1.is_amo);
 
+    // FIX 6: flags para indicar se há de facto uma instrução de memória
+    wire is_any_mem = issue_instr0.is_load  || issue_instr0.is_store  ||
+                      issue_instr0.is_amo   || issue_instr0.is_fp_load ||
+                      issue_instr0.is_fp_store || is_mem1;
+
     assign mem_vaddr = is_mem1 ?
         (issue1_rs1_data[VADDR_WIDTH-1:0] + issue_instr1.imm[VADDR_WIDTH-1:0]) :
         (issue0_rs1_data[VADDR_WIDTH-1:0] + issue_instr0.imm[VADDR_WIDTH-1:0]);
@@ -523,7 +525,11 @@ module nebula_backend_fpu #(
                     next_state = S_EXECUTE;
             end
             S_EXECUTE: begin
-                if (issue_instr0.is_ecall || issue_instr0.is_ebreak || (issue_instr0.is_csr && csr_fault)) 
+                if (issue_instr0.is_ecall || issue_instr0.is_ebreak || (issue_instr0.is_csr && csr_fault))
+                    next_state = S_TRAP;
+                else if ((issue_instr0.is_load || issue_instr0.is_store || issue_instr0.is_amo ||
+                         (issue_valid1 && (issue_instr1.is_load || issue_instr1.is_store || issue_instr1.is_amo)))
+                         && mem_vaddr == 39'd0)
                     next_state = S_TRAP;
                 else if (issue_instr0.is_load || issue_instr0.is_store ||
                          issue_instr0.is_fp_load || issue_instr0.is_fp_store ||
@@ -564,28 +570,23 @@ module nebula_backend_fpu #(
     end
 
     // ------------------------------------------------------------------------
-    // Geração de Write Strobe (Máscara de Bytes)
+    // Write Strobe
     // ------------------------------------------------------------------------
     logic [7:0] dmem_wstrb;
     logic [2:0] mem_funct3;
-    
-    // Descobre qual instrução está indo para a memória
+
     assign mem_funct3 = mem_is_instr1 ? issue_instr1.funct3 : issue_instr0.funct3;
 
     always_comb begin
         dmem_wstrb = 8'h00;
-        
-        // Se for um Store, geramos a máscara baseada no funct3 (tamanho)
-        if ((!mem_is_instr1 && issue_instr0.is_store) || 
+        if ((!mem_is_instr1 && issue_instr0.is_store) ||
             ( mem_is_instr1 && issue_instr1.is_store)) begin
-            
             case (mem_funct3[1:0])
-                2'b00: dmem_wstrb = 8'h01; // SB (1 byte)
-                2'b01: dmem_wstrb = 8'h03; // SH (2 bytes)
-                2'b10: dmem_wstrb = 8'h0F; // SW (4 bytes)
-                2'b11: dmem_wstrb = 8'hFF; // SD (8 bytes)
+                2'b00: dmem_wstrb = 8'h01;
+                2'b01: dmem_wstrb = 8'h03;
+                2'b10: dmem_wstrb = 8'h0F;
+                2'b11: dmem_wstrb = 8'hFF;
             endcase
-            
             dmem_wstrb = dmem_wstrb << exec_mem_addr[2:0];
         end
     end
@@ -599,32 +600,30 @@ module nebula_backend_fpu #(
     assign backend_ctrl.stall = (state != S_IDLE);
     assign backend_ctrl.flush = (state == S_TRAP) ||
                                 (state == S_WRITEBACK && (
-                                    (bp_update.valid && bp_update.mispredicted) || 
-                                    mret_pending || 
+                                    (bp_update.valid && bp_update.mispredicted) ||
+                                    mret_pending ||
                                     sret_pending
-                                ));   
+                                ));
     assign backend_ctrl.redirect = backend_ctrl.flush;
-    
-    // Se o trap_vector for menor que a base da ROM (ex: 0x40), injetamos a base!
-    assign safe_trap_vector = (trap_vector < 39'h10000000) ? 
-                              (trap_vector | 39'h10000000) : 
+
+    assign safe_trap_vector = (trap_vector < 39'h10000000) ?
+                              (trap_vector | 39'h10000000) :
                               trap_vector[VADDR_WIDTH-1:0];
-                              
+
     assign backend_ctrl.redirect_pc = (state == S_TRAP) ? safe_trap_vector : exec_branch_target;
 
-    assign bp_update.valid       = (state == S_WRITEBACK) && 
+    assign bp_update.valid       = (state == S_WRITEBACK) &&
                                    (issue_instr0.is_branch || issue_instr0.is_jal || issue_instr0.is_jalr ||
                                    (issue_valid1 && (issue_instr1.is_branch || issue_instr1.is_jal || issue_instr1.is_jalr)));
     assign bp_update.taken       = exec_branch_taken;
     assign bp_update.mispredicted = exec_branch_taken != issue_instr0.bp_pred.taken;
     assign bp_update.pc          = (issue_valid1 && (issue_instr1.is_branch || issue_instr1.is_jal || issue_instr1.is_jalr)) ? issue_instr1.pc : issue_instr0.pc;
     assign bp_update.target      = exec_branch_target;
-    assign bp_update.is_call     = (issue_instr0.is_jal && (issue_instr0.rd == 5'd1 || issue_instr0.rd == 5'd5)) || 
+    assign bp_update.is_call     = (issue_instr0.is_jal && (issue_instr0.rd == 5'd1 || issue_instr0.rd == 5'd5)) ||
                                    (issue_valid1 && issue_instr1.is_jal && (issue_instr1.rd == 5'd1 || issue_instr1.rd == 5'd5));
     assign bp_update.is_ret      = (issue_instr0.is_jalr && (issue_instr0.rs1 == 5'd1 || issue_instr0.rs1 == 5'd5)) ||
                                    (issue_valid1 && issue_instr1.is_jalr && (issue_instr1.rs1 == 5'd1 || issue_instr1.rs1 == 5'd5));
 
-    // dcache_we considera dual-issue
     assign dcache_req    = (state == S_MEM_ACCESS);
     assign dcache_we     = is_mem1 ? (issue_instr1.is_store || issue_instr1.is_fp_store) :
                                      (issue_instr0.is_store || issue_instr0.is_fp_store);
@@ -643,7 +642,9 @@ module nebula_backend_fpu #(
 
     assign ptw_req = (state == S_MEM_TLB) && !dtlb_hit && !dtlb_page_fault;
 
-    assign mdu_req    = (state == S_ISSUE) && issue_instr0.is_mdu;
+    assign mdu_req = (state == S_ISSUE || state == S_MDU_WAIT) 
+                 && issue_instr0.is_mdu 
+                 && !mdu_resp_valid;
     assign mdu_rs1    = issue0_rs1_data;
     assign mdu_rs2    = issue0_rs2_data;
     assign mdu_funct3 = issue_instr0.funct3;
@@ -657,7 +658,6 @@ module nebula_backend_fpu #(
     assign fpu_rs3      = issue0_frs3_data;
     assign fpu_int_rs1  = issue0_rs1_data;
     assign fpu_is_single = issue_instr0.is_fp_single;
-    // FIX 1: fpu_rm conectado ao campo rm da instrução decodificada
     assign fpu_rm       = issue_instr0.rm;
 
     assign csr_req   = (state == S_EXECUTE) && issue_instr0.is_csr;
@@ -806,10 +806,25 @@ module nebula_backend_fpu #(
                         mem_is_instr1      <= 1'b0;
                     end
 
-                    if (!mmu_enabled)
+                    if (!mmu_enabled && is_any_mem)
                         dcache_addr <= {{(PADDR_WIDTH-VADDR_WIDTH){1'b0}}, mem_vaddr};
 
-                    // Traps (instr0 apenas — instr1 só é ALU, sem traps)
+                    if ((issue_instr0.is_load || issue_instr0.is_store || issue_instr0.is_amo || 
+                        (issue_valid1 && (issue_instr1.is_load || issue_instr1.is_store || issue_instr1.is_amo))) 
+                        && mem_vaddr == 39'd0) begin
+                        
+                        exec_trap <= 1'b1;
+                        trap_is_interrupt <= 1'b0;
+                        // Regista o PC exato da instrução culpadíssima:
+                        trap_pc <= mem_is_instr1 ? 
+                                   {{(XLEN-VADDR_WIDTH){issue_instr1.pc[VADDR_WIDTH-1]}}, issue_instr1.pc} : 
+                                   {{(XLEN-VADDR_WIDTH){issue_instr0.pc[VADDR_WIDTH-1]}}, issue_instr0.pc};
+                        
+                        exec_trap_cause <= dcache_we ? EXC_STORE_ACCESS_FAULT : EXC_LOAD_ACCESS_FAULT;
+                        trap_cause <= {58'b0, dcache_we ? 6'(EXC_STORE_ACCESS_FAULT) : 6'(EXC_LOAD_ACCESS_FAULT)};
+                        trap_value <= '0;
+                    end
+                    // Traps
                     if (issue_instr0.is_ecall) begin
                         exec_trap <= 1'b1;
                         trap_is_interrupt <= 1'b0;
@@ -860,7 +875,6 @@ module nebula_backend_fpu #(
                     end else if (dtlb_page_fault) begin
                         exec_trap <= 1'b1;
                         trap_is_interrupt <= 1'b0;
-                        // FIX 5: trap_pc aponta para a instrução que gerou a fault
                         trap_pc <= mem_is_instr1 ?
                                    {{(XLEN-VADDR_WIDTH){issue_instr1.pc[VADDR_WIDTH-1]}}, issue_instr1.pc} :
                                    {{(XLEN-VADDR_WIDTH){issue_instr0.pc[VADDR_WIDTH-1]}}, issue_instr0.pc};
@@ -897,35 +911,45 @@ module nebula_backend_fpu #(
                             trap_cause <= {58'b0, dcache_we ? 6'(EXC_STORE_ACCESS_FAULT) : 6'(EXC_LOAD_ACCESS_FAULT)};
                             trap_value <= {{(XLEN-VADDR_WIDTH){exec_mem_addr[VADDR_WIDTH-1]}}, exec_mem_addr};
                         end else if (issue_instr0.is_load || (issue_valid1 && issue_instr1.is_load)) begin
-                            mem0_result <= sign_extend_load(dcache_resp_data,
-                                          mem_is_instr1 ? issue_instr1.funct3 : issue_instr0.funct3);
+                            if (mem_is_instr1)
+                                mem1_result <= sign_extend_load(dcache_resp_data, issue_instr1.funct3);
+                            else
+                                mem0_result <= sign_extend_load(dcache_resp_data, issue_instr0.funct3);
                         end else if (issue_instr0.is_fp_load) begin
                             mem_fp_result <= dcache_resp_data;
+                            
                         end else if (issue_instr0.is_amo || (issue_valid1 && issue_instr1.is_amo)) begin
-                            mem0_result <= dcache_resp_data;
+                            if (mem_is_instr1)
+                                mem1_result <= dcache_resp_data;
+                            else
+                                mem0_result <= dcache_resp_data;
                         end
                     end
                 end
 
                 S_WRITEBACK: begin
+                    if (backend_ctrl.flush) begin
+                    next_state = S_IDLE;
+                    end else if (frontend_valid) begin
+                        next_state = S_EXECUTE; // Só acelera se o pipeline estiver limpo
+                    end else begin
+                        next_state = S_IDLE;
+                    end
                     if (!mem_is_instr1) begin
-                        
-                        // 1. Gravar a Instr 0 (Load/AMO ou ALU)
                         if (issue_instr0.is_load || issue_instr0.is_amo) begin
                             regfile[issue_instr0.rd] <= mem0_result;
                             mem0_rd     <= issue_instr0.rd;
                             mem0_int_we <= 1'b1;
-                        end else if (issue_instr0.rd != 5'd0 && !issue_instr0.is_store && 
+                        end else if (issue_instr0.rd != 5'd0 && !issue_instr0.is_store &&
                                      (!issue_instr0.is_branch || issue_instr0.is_jal || issue_instr0.is_jalr) &&
                                      (!issue_instr0.is_fp || (decoded_fpu_op inside {FPU_CMP_EQ, FPU_CMP_LT, FPU_CMP_LE, FPU_CVT_W, FPU_CVT_WU, FPU_CVT_L, FPU_CVT_LU, FPU_CLASS, FPU_MV_X_W}))) begin
                             regfile[issue_instr0.rd] <= exec_result0;
                             mem0_rd     <= issue_instr0.rd;
                             mem0_int_we <= 1'b1;
                         end
-                        
-                        // 2. Gravar a Instr 1 (ALU, etc)
+
                         if (issue_valid1) begin
-                            if (issue_instr1.rd != 5'd0 && !issue_instr1.is_store && 
+                            if (issue_instr1.rd != 5'd0 && !issue_instr1.is_store &&
                                (!issue_instr1.is_branch || issue_instr1.is_jal || issue_instr1.is_jalr) && !issue_instr1.is_fp) begin
                                 regfile[issue_instr1.rd] <= exec_result1;
                                 mem1_rd     <= issue_instr1.rd;
@@ -933,22 +957,19 @@ module nebula_backend_fpu #(
                             end
                         end
                     end else begin
-                        
-                        // 1. Gravar a Instr 0 (ALU, etc)
-                        if (issue_instr0.rd != 5'd0 && !issue_instr0.is_store && 
+                        if (issue_instr0.rd != 5'd0 && !issue_instr0.is_store &&
                             (!issue_instr0.is_branch || issue_instr0.is_jal || issue_instr0.is_jalr) &&
                             (!issue_instr0.is_fp || (decoded_fpu_op inside {FPU_CMP_EQ, FPU_CMP_LT, FPU_CMP_LE, FPU_CVT_W, FPU_CVT_WU, FPU_CVT_L, FPU_CVT_LU, FPU_CLASS, FPU_MV_X_W}))) begin
                             regfile[issue_instr0.rd] <= exec_result0;
                             mem0_rd     <= issue_instr0.rd;
                             mem0_int_we <= 1'b1;
                         end
-                        
-                        // 2. Gravar a Instr 1 (Load/AMO ou ALU falhada)
+
                         if (issue_instr1.is_load || issue_instr1.is_amo) begin
                             regfile[issue_instr1.rd] <= mem1_result;
                             mem1_rd     <= issue_instr1.rd;
                             mem1_int_we <= 1'b1;
-                        end else if (issue_instr1.rd != 5'd0 && !issue_instr1.is_store && 
+                        end else if (issue_instr1.rd != 5'd0 && !issue_instr1.is_store &&
                                     (!issue_instr1.is_branch || issue_instr1.is_jal || issue_instr1.is_jalr) && !issue_instr1.is_fp) begin
                             regfile[issue_instr1.rd] <= exec_result1;
                             mem1_rd     <= issue_instr1.rd;
@@ -980,30 +1001,28 @@ module nebula_backend_fpu #(
     end
 
     // =================================================================
-    // RADAR DE DIAGNÓSTICO PROFUNDO (TRAPS E STALLS)
+    // RADAR DE DIAGNÓSTICO PROFUNDO
     // =================================================================
     // synthesis translate_off
     logic [31:0] watchdog_timer;
-    
+
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             watchdog_timer <= 0;
         end else begin
-            // 1. DETEÇÃO DE EXCEÇÕES (O CPU deu erro?)
             if (trap_enter) begin
                 $display("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
                 $display("[NEBULA TRAP] EXCECAO FATAL NO PC: %h", trap_pc);
                 $display("              CAUSA (mcause): %d | SALTANDO PARA: %h", trap_cause, trap_vector);
                 $display("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
             end
-            
-            // 2. DETEÇÃO DE STALL (O CPU congelou à espera de algo?)
+
             if (state == S_WRITEBACK) begin
-                watchdog_timer <= 0; // O pipeline andou, reseta o temporizador
+                watchdog_timer <= 0;
             end else begin
                 watchdog_timer <= watchdog_timer + 1;
                 if (watchdog_timer == 100000) begin
-                    $display("\n[NEBULA WATCHDOG] PIPELINE CONGELADO HÁ 100 MIL CICLOS NO PC: %h", issue_instr0.pc);
+                    $display("\n[NEBULA WATCHDOG] PIPELINE CONGELADO HA 100 MIL CICLOS NO PC: %h", issue_instr0.pc);
                     $display("                  ESTADO DA FSM: %d", state);
                 end
             end
@@ -1014,7 +1033,6 @@ module nebula_backend_fpu #(
     // synthesis translate_off
     always_ff @(posedge clk) begin
         if (state == S_WRITEBACK) begin
-            // Se for uma instrução de leitura (Load) e o endereço for altíssimo (fora da RAM/ROM)
             if (issue_instr0.is_load && alu0_result[31:28] >= 4'h8) begin
                 $display("[NEBULA MMIO] Lendo Periferico no Endereco: %h", alu0_result);
             end
@@ -1023,11 +1041,11 @@ module nebula_backend_fpu #(
     // synthesis translate_on
 
     // =================================================================
-    // RADAR DE BATIMENTO CARDÍACO (Heartbeat)
+    // HEARTBEAT
     // =================================================================
     // synthesis translate_off
     logic [31:0] heartbeat_counter;
-    
+
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             heartbeat_counter <= 0;
@@ -1040,4 +1058,5 @@ module nebula_backend_fpu #(
         end
     end
     // synthesis translate_on
+
 endmodule

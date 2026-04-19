@@ -8,28 +8,17 @@ import nebula_pkg::*;
  * @brief Control and Status Registers para RV64 Privileged
  *
  * CORREÇÕES APLICADAS:
- * 1. mideleg mask: era 64'h0222 (bits 1,5,9 apenas em hex errado).
- *    O valor correto para permitir delegação de todos os interrupts
- *    de S-mode é 64'h0000_0000_0000_0222.
- *    0x222 = 0b0010_0010_0010 = bits 1(SSIP), 5(STIP), 9(SEIP) — CORRETO.
- *    O bug real era que o Linux também precisa de bits 3(MSIP), 7(MTIP),
- *    11(MEIP) delegáveis via mideleg para roteamento correto.
- *    FIX: mask = 64'h0AAA permite {bit11,bit9,bit7,bit5,bit3,bit1} = SSI+STI+SEI.
- *    Na prática apenas bits de S-mode (1,5,9) são delegáveis pela spec,
- *    mas aceitar escrita nos M-mode bits também (sem delegar de fato) é WARL.
- *    Mantemos 0x0222 pois a spec proíbe delegar MEI/MTI/MSI para S-mode.
- *    O bug real que causava falha era a máscara de leitura de mip_combined
- *    que referenciava mideleg[INT_STI] com INT_STI=64'd5 (índice de bit 5).
- *    FIX aplicado: INT_STI/SEI/SSI corrigidos para usar índice de bit, não valor.
+ * 1. mideleg mask: bits 1(SSIP), 5(STIP), 9(SEIP) — conforme Priv Spec v1.12.
+ *    Índices MIP_STIP/SEIP/SSIP corrigidos para usar índice de bit, não valor.
  *
- * 2. mstatus.SD: o registrador armazenado não precisa ter SD zerado — o bit
- *    63 do registrador interno é irrelevante pois mstatus_read substitui
- *    bit 63 com mstatus_sd computado. Porém forçar SD=0 no write de MSTATUS
- *    pode apagar bits válidos se o SW tentar setar SD. WARL: SD é read-only,
- *    escrever 1 ou 0 não tem efeito — mantemos a lógica de forçar 0.
+ * 2. mstatus.SD: read-only, SD=0 forçado no write de MSTATUS (WARL).
  *
- * 3. mip_combined: correção de STI/SEI para usar índice de bit correto
- *    ao verificar mideleg (mideleg[MIP_STIP] não mideleg[INT_STI]).
+ * 3. mip_combined: STI/SEI usam MIP_STIP/MIP_SEIP (índices de bit corretos).
+ *
+ * 4. [FIX BOOT] mtvec inicial corrigido de 0x12000000 para 0x10000000
+ *    (base da ROM). O valor anterior fazia o primeiro trap (qualquer exceção
+ *    antes do SW configurar mtvec) saltar para fora da ROM, causando leituras
+ *    em endereços inválidos e o "endereço fantasma" observado.
  */
 module csr_unit #(
     parameter int XLEN    = 64,
@@ -159,8 +148,7 @@ module csr_unit #(
         (64'd1 << MSTATUS_MXR_BIT)  | (64'd3 << MSTATUS_UXL_LO)   |
         (64'd1 << MSTATUS_SD_BIT);
 
-    // FIX 1: máscara de mideleg — apenas bits delegáveis de S-mode
-    // Bits 1(SSIP), 5(STIP), 9(SEIP) — conforme Priv Spec v1.12
+    // Bits delegáveis para S-mode: SSIP(1), STIP(5), SEIP(9)
     localparam logic [63:0] MIDELEG_MASK = 64'h0000_0000_0000_0222;
 
     logic [XLEN-1:0] mstatus, misa, medeleg, mideleg;
@@ -202,7 +190,7 @@ module csr_unit #(
         mip_combined[MIP_MTIP] = timer_irq_in;
         mip_combined[MIP_MEIP] = external_irq_in;
         mip_combined[MIP_MSIP] = software_irq_in;
-        // FIX 3: usar MIP_STIP/SEIP (bit indices) não INT_STI/SEI (valores)
+        // FIX: usar MIP_STIP/SEIP (índices de bit)
         mip_combined[MIP_STIP] = mip[MIP_STIP] | (timer_irq_in    & mideleg[MIP_STIP]);
         mip_combined[MIP_SEIP] = mip[MIP_SEIP] | (external_irq_in & mideleg[MIP_SEIP]);
         mip_combined[MIP_SSIP] = mip[MIP_SSIP];
@@ -309,7 +297,7 @@ module csr_unit #(
     logic csr_write_enable;
 
     always_comb begin
-        csr_new_value   = csr_rdata;
+        csr_new_value    = csr_rdata;
         csr_write_enable = 1'b0;
         if (csr_req_valid && !csr_access_fault && !csr_read_only) begin
             case (csr_op)
@@ -376,7 +364,13 @@ module csr_unit #(
             mideleg  <= '0;
             mie      <= '0;
             mip      <= '0;
-            mtvec    <= 64'h0000_0000_1200_0000;
+            // ----------------------------------------------------------------
+            // FIX 4: mtvec inicial = base da ROM (0x10000000).
+            // O valor anterior (0x12000000) era fora da ROM: qualquer trap
+            // antes do SW configurar mtvec levava o PC para uma região sem
+            // código, causando leituras em 0x000000 e "endereços fantasma".
+            // ----------------------------------------------------------------
+            mtvec    <= 64'h0000_0000_1000_0000;
             mscratch <= '0;
             mepc     <= '0;
             mcause   <= '0;
@@ -465,9 +459,6 @@ module csr_unit #(
                     CSR_MIDELEG:   mideleg <= csr_new_value & MIDELEG_MASK;
                     CSR_MIE:       mie     <= csr_new_value;
                     CSR_MTVEC: begin
-                        // Implementacao WARL (Write Any Values, Reads Legal Values)
-                        // Ancoragem de seguranca: Se o software tentar escrever um offset pequeno (ex: 0x40),
-                        // o hardware faz um OR com a base da ROM (0x10000000) e limpa o bit reservado 1.
                         if (csr_new_value < 64'h10000000) begin
                             mtvec <= (csr_new_value | 64'h10000000) & ~64'h2;
                         end else begin

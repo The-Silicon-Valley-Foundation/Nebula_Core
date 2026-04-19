@@ -7,16 +7,17 @@ import nebula_pkg::*;
  * @module dcache_l1
  * @brief Cache de Dados L1 - 32KB, 4-way set associative, write-back
  *
- * 1. Todas as declarações "logic" removidas de dentro de always_ff e
- * always_comb — movidas para sinais de módulo.
- * 2. found_dirty removido do bloco always_comb da FSM e declarado
- * como sinal de módulo.
- * 3. *_tmp que eram variáveis locais dentro de always_ff com
- * blocking assignment movidos para blocos always_comb separados.
- * Isso elimina os warnings BLKSEQ do Verilator 5.036.
- * 4. BLINDAGEM ANTI-FANTASMA: Proteção no sinal req_ready através do
- * registo prev_resp_valid para evitar que a Cache processe a mesma
- * instrução duas vezes devido a 1 ciclo de "eco" do Backend.
+ * CORREÇÕES APLICADAS:
+ * 1. Declarações "logic" removidas de dentro de always_ff e always_comb.
+ * 2. found_dirty declarado como sinal de módulo.
+ * 3. *_tmp movidos para blocos always_comb separados (elimina BLKSEQ).
+ * 4. [FIX BOOT] BLINDAGEM ANTI-FANTASMA CORRIGIDA: o shift register de
+ *    proteção foi ampliado de 1 para 2 ciclos (resp_valid_sr[1:0]).
+ *    Com apenas 1 ciclo, o backend conseguia re-enviar dcache_req no
+ *    exato ciclo em que req_ready voltava a subir (S_HIT_PROCESS -> S_IDLE),
+ *    fazendo a cache processar a mesma requisição duas vezes. Agora
+ *    req_ready só volta a subir após 2 ciclos de silêncio, garantindo
+ *    que o backend tenha lido a resposta e baixado dcache_req.
  */
 module dcache_l1 #(
     parameter int PADDR_WIDTH = 56,
@@ -91,8 +92,8 @@ module dcache_l1 #(
         S_FLUSH_SCAN,
         S_FLUSH_WB,
         S_ERROR,
-        S_MMIO_REQ,   
-        S_MMIO_WAIT,  
+        S_MMIO_REQ,
+        S_MMIO_WAIT,
         S_MMIO_DONE
     } state_t;
 
@@ -114,49 +115,35 @@ module dcache_l1 #(
     logic [INDEX_BITS-1:0]       flush_set_idx;
     logic [$clog2(NUM_WAYS)-1:0] flush_way_idx;
 
-    // Tag comparison signals
     logic [NUM_WAYS-1:0]         hit_way;
     logic                        cache_hit;
     logic [$clog2(NUM_WAYS)-1:0] hit_way_idx;
     logic                        victim_dirty;
     logic [TAG_BITS-1:0]         victim_tag;
 
-    // Sinais de nível de módulo para combinatorial intermediário
     logic                        found_dirty;
     logic [LINE_BITS-1:0]        hit_line;
     logic [XLEN-1:0]             selected_word;
 
-    // =========================================================================
-    // FIX BLKSEQ: cálculos intermediários em always_comb separados
-    // =========================================================================
-
-    // Para S_HIT_PROCESS
     logic [XLEN-1:0]             hit_new_word;
     logic [LINE_BITS-1:0]        hit_new_line;
-
-    // Para S_REFILL_DONE
     logic [XLEN-1:0]             refill_word_from_buf;
     logic [XLEN-1:0]             refill_new_word;
     logic [LINE_BITS-1:0]        refill_new_line;
-
-    // Para S_AMO_PROCESS
     logic [XLEN-1:0]             amo_current_word;
     logic [XLEN-1:0]             amo_result;
     logic [LINE_BITS-1:0]        amo_new_line;
-
-    // Para S_FLUSH_SCAN
     logic                        flush_found;
     logic [INDEX_BITS-1:0]       flush_set_next;
     logic [$clog2(NUM_WAYS)-1:0] flush_way_next;
 
     // =========================================================================
-    // Detecção de MMIO (Memory Mapped I/O)
+    // Detecção de MMIO
     // =========================================================================
-    // Qualquer endereço >= 0x1f0000000 é tratado como Periférico (Uncached)
     wire is_mmio = (req_addr >= 56'h1f00_0000);
 
     // =========================================================================
-    // Tag Comparison (combinacional)
+    // Tag Comparison
     // =========================================================================
     always_comb begin
         hit_way    = '0;
@@ -177,7 +164,7 @@ module dcache_l1 #(
     end
 
     // =========================================================================
-    // Data Selection (combinacional)
+    // Data Selection
     // =========================================================================
     always_comb begin
         hit_line      = '0;
@@ -201,17 +188,11 @@ module dcache_l1 #(
         endcase
     end
 
-    // =========================================================================
-    // S_HIT_PROCESS — cálculo combinacional
-    // =========================================================================
     always_comb begin
         hit_new_word = apply_wstrb(selected_word, wdata_reg, wstrb_reg);
         hit_new_line = modify_line(hit_line, hit_new_word, word_offset_reg);
     end
 
-    // =========================================================================
-    // S_REFILL_DONE — cálculo combinacional
-    // =========================================================================
     always_comb begin
         case (word_offset_reg)
             3'd0: refill_word_from_buf = line_buffer[63:0];
@@ -232,9 +213,6 @@ module dcache_l1 #(
             refill_new_line = line_buffer;
     end
 
-    // =========================================================================
-    // S_AMO_PROCESS — cálculo combinacional
-    // =========================================================================
     always_comb begin
         amo_current_word = selected_word;
         amo_result   = compute_amo(amo_op_reg, amo_current_word, wdata_reg,
@@ -243,9 +221,6 @@ module dcache_l1 #(
                                    amo_result, word_offset_reg);
     end
 
-    // =========================================================================
-    // S_FLUSH_SCAN — cálculo combinacional
-    // =========================================================================
     always_comb begin
         flush_found    = 1'b0;
         flush_set_next = flush_set_idx;
@@ -256,7 +231,6 @@ module dcache_l1 #(
                 if (!flush_found &&
                     tag_array[s][w].valid &&
                     tag_array[s][w].dirty) begin
-    
                     flush_set_next = s[INDEX_BITS-1:0];
                     flush_way_next = w[$clog2(NUM_WAYS)-1:0];
                     flush_found    = 1'b1;
@@ -300,7 +274,6 @@ module dcache_l1 #(
         return result;
     endfunction
 
-    // AMO opcodes
     localparam AMO_LR   = 5'b00010;
     localparam AMO_SC   = 5'b00011;
     localparam AMO_SWAP = 5'b00001;
@@ -346,7 +319,6 @@ module dcache_l1 #(
         return result;
     endfunction
 
-    // Pseudo-LRU
     function automatic logic [$clog2(NUM_WAYS)-1:0] get_plru_victim(
         input logic [2:0] plru
     );
@@ -373,12 +345,23 @@ module dcache_l1 #(
     endfunction
 
     // =========================================================================
-    // Proteção Anti-Fantasma
+    // FIX 4: Proteção Anti-Fantasma — shift register de 2 ciclos
+    //
+    // Com apenas 1 ciclo (prev_resp_valid), o backend podia re-enviar
+    // dcache_req no mesmo ciclo em que req_ready voltava a subir
+    // (transição S_HIT_PROCESS -> S_IDLE), causando uma segunda
+    // requisição idêntica à primeira ("requisição fantasma").
+    //
+    // Com 2 ciclos de supressão, req_ready só volta a subir APÓS o
+    // backend ter observado resp_valid e baixado dcache_req.
     // =========================================================================
-    logic prev_resp_valid;
+    logic [1:0] resp_valid_sr;  // shift register: [0]=ciclo atual, [1]=ciclo anterior
+
     always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) prev_resp_valid <= 1'b0;
-        else        prev_resp_valid <= resp_valid;
+        if (!rst_n)
+            resp_valid_sr <= 2'b00;
+        else
+            resp_valid_sr <= {resp_valid_sr[0], resp_valid};
     end
 
     // =========================================================================
@@ -452,12 +435,10 @@ module dcache_l1 #(
             end
 
             S_MMIO_REQ:  next_state = S_MMIO_WAIT;
-
             S_MMIO_WAIT: begin
                 if (mem_ack)        next_state = S_MMIO_DONE;
                 else if (mem_error) next_state = S_ERROR;
             end
-
             S_MMIO_DONE: next_state = S_IDLE;
 
             S_ERROR: next_state = S_IDLE;
@@ -499,12 +480,8 @@ module dcache_l1 #(
                 mem_req      = (state == S_MMIO_REQ);
                 mem_we       = we_reg;
                 mem_addr     = addr_reg;
-                mem_uncached = 1'b1; 
-                
-                // Colocar a palavra de 64 bits no offset exato do barramento de 512 bits
+                mem_uncached = 1'b1;
                 mem_wdata[word_offset_reg * 64 +: 64] = wdata_reg;
-                
-                // Ligar APENAS os bytes que o CPU quer escrever
                 mem_wstrb = '0;
                 mem_wstrb[word_offset_reg * 8 +: 8] = we_reg ? wstrb_reg : 8'hFF;
             end
@@ -513,9 +490,10 @@ module dcache_l1 #(
     end
 
     // =========================================================================
-    // Saídas para Backend e Controle de Eco (Phantom Request)
+    // Saídas para Backend
     // =========================================================================
-    assign req_ready  = (state == S_IDLE) && !flush_all && !flush_addr_valid && !prev_resp_valid;
+    // FIX 4: req_ready suprimido por 2 ciclos após resp_valid
+    assign req_ready  = (state == S_IDLE) && !flush_all && !flush_addr_valid && !resp_valid_sr[1];
     assign flush_done = (state == S_FLUSH_SCAN) && (next_state == S_IDLE);
 
     always_comb begin
@@ -616,8 +594,8 @@ module dcache_l1 #(
                 case (state)
                     S_IDLE: begin
                         if (flush_all) begin
-                             flush_set_idx <= '0;
-                             flush_way_idx <= '0;
+                            flush_set_idx <= '0;
+                            flush_way_idx <= '0;
                         end else if (req_valid && req_ready) begin
                             addr_reg        <= req_addr;
                             index_reg       <= req_index;

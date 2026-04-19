@@ -25,7 +25,7 @@ class NebulaCPU(CPU):
     gcc_triple           = CPU_GCC_TRIPLE_RISCV64
     linker_output_format = "elf64-littleriscv"
     nop                  = "nop"
-    io_regions           = {0xF0000000: 0x10000000} # FIX: Periféricos no topo da memória
+    io_regions           = {0xF0000000: 0x40000000}
     family               = "riscv"
     category             = "softcore"
     variants             = ["standard"]
@@ -34,9 +34,9 @@ class NebulaCPU(CPU):
     def mem_map(self):
         return {
             "rom":      0x10000000,
-            "sram":     0x11000000,
-            "main_ram": 0x40000000, # FIX: RAM realocada para o padrão da indústria
-            "csr":      0xF0000000, # FIX: CSRs e UART no topo
+            "sram":     0x10008000,
+            "main_ram": 0x40000000,
+            "csr":      0xf0000000,
         }
 
     @property
@@ -50,7 +50,7 @@ class NebulaCPU(CPU):
         self.reset_address = 0x10000000
 
         # AXI de 64 bits para o LiteX
-        self.axi      = axi.AXIInterface(data_width=64, address_width=32, id_width=4)
+        self.axi      = axi.AXIInterface(data_width=64, address_width=56, id_width=4)
         self.periph_buses = [self.axi]
         self.memory_buses = [self.axi]
 

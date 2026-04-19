@@ -39,7 +39,8 @@ module l2_cache #(
     output logic [LINE_SIZE*8-1:0]  mem_wdata,
     input  wire                     mem_ack,
     input  wire [LINE_SIZE*8-1:0]   mem_rdata,
-    input  wire                     mem_error
+    input  wire                     mem_error,
+    input  logic                    mem_ready
 );
 
     localparam int TOTAL_SETS    = (SIZE_KB * 1024) / (NUM_WAYS * LINE_SIZE);
@@ -61,6 +62,7 @@ module l2_cache #(
     l2_tag_t              tag_array  [NUM_BANKS][SETS_PER_BANK][NUM_WAYS];
     logic [LINE_BITS-1:0] data_array [NUM_BANKS][SETS_PER_BANK][NUM_WAYS];
     logic [6:0]           plru_bits  [NUM_BANKS][SETS_PER_BANK];
+    logic [$clog2(NUM_BANKS)-1:0] mem_owner;
 
     typedef enum logic [3:0] {
         S_IDLE, S_SELECT, S_TAG_CHECK, S_HIT, S_SNOOP_REQ, S_SNOOP_WAIT,
@@ -276,7 +278,10 @@ module l2_cache #(
                             end
                         end
 
-                        S_FILL_REQ: state[b] <= S_FILL_WAIT;
+                        S_FILL_REQ: begin
+                            if (mem_ready && bus_busy && bus_owner == b[$clog2(NUM_BANKS)-1:0])
+                                state[b] <= S_FILL_WAIT;
+                        end
 
                         S_FILL_WAIT: begin
                             if (mem_ack && !mem_error) begin
@@ -356,19 +361,52 @@ module l2_cache #(
         mem_addr  = '0;
         mem_wdata = '0;
 
-        for (int bi = 0; bi < NUM_BANKS; bi++) begin
-            if (state[bi] == S_EVICT_WAIT) begin
-                mem_req  = 1'b1;
-                mem_we   = 1'b1;
-                mem_addr = {tag_array[bi][get_index(req_reg[bi].addr)][victim_way[bi]].tag,
-                            get_index(req_reg[bi].addr), bi[BANK_BITS-1:0], {OFFSET_BITS{1'b0}}};
-                mem_wdata = line_buf[bi];
-                break;
-            end else if (state[bi] == S_FILL_WAIT) begin
+        if (bus_busy) begin
+            // Só o dono do barramento fala com a memória
+            if (state[bus_owner] == S_EVICT_WAIT) begin
+                mem_req   = 1'b1;
+                mem_we    = 1'b1;
+                mem_addr  = {tag_array[bus_owner][get_index(req_reg[bus_owner].addr)][victim_way[bus_owner]].tag,
+                            get_index(req_reg[bus_owner].addr),
+                            bus_owner[BANK_BITS-1:0],
+                            {OFFSET_BITS{1'b0}}};
+                mem_wdata = line_buf[bus_owner];
+            end else if (state[bus_owner] == S_FILL_REQ ||
+                        state[bus_owner] == S_FILL_WAIT) begin
                 mem_req  = 1'b1;
                 mem_we   = 1'b0;
-                mem_addr = {req_reg[bi].addr[PADDR_WIDTH-1:OFFSET_BITS], {OFFSET_BITS{1'b0}}};
-                break;
+                mem_addr = {req_reg[bus_owner].addr[PADDR_WIDTH-1:OFFSET_BITS], {OFFSET_BITS{1'b0}}};
+            end
+        end
+    end
+
+    // =========================================================================
+    // Árbitro de barramento — garante acesso exclusivo ao mem_req/mem_ack
+    // =========================================================================
+    logic                        bus_busy;
+    logic [$clog2(NUM_BANKS)-1:0] bus_owner;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            bus_busy  <= 1'b0;
+            bus_owner <= '0;
+        end else begin
+            if (!bus_busy) begin
+                // Conceder o barramento ao primeiro banco que precisar
+                for (int bi = 0; bi < NUM_BANKS; bi++) begin
+                    if (state[bi] == S_EVICT_WAIT || state[bi] == S_FILL_REQ) begin
+                        bus_busy  <= 1'b1;
+                        bus_owner <= bi[$clog2(NUM_BANKS)-1:0];
+                        break;
+                    end
+                end
+            end else begin
+                // Liberar quando o banco dono terminar (sai de EVICT_WAIT ou FILL_WAIT)
+                if (state[bus_owner] != S_EVICT_WAIT &&
+                    state[bus_owner] != S_FILL_REQ   &&
+                    state[bus_owner] != S_FILL_WAIT) begin
+                    bus_busy <= 1'b0;
+                end
             end
         end
     end

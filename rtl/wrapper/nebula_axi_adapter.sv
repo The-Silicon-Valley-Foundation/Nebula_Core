@@ -4,11 +4,6 @@
  * @module nebula_axi_adapter
  * @brief Adaptador Nebula (512-bit) <-> AXI4 (64-bit)
  *
- * PROTOCOLO AXI4 utilizado:
- * - INCR burst (arburst/awburst = 2'b01)
- * - 8 beats de 64 bits = 512 bits por transação (arlen/awlen = 8'd7)
- * - arsize/awsize = 3'b011 (8 bytes por beat)
- * - Endereço sempre alinhado a 64 bytes (linha de cache)
  */
 module nebula_axi_adapter #(
     parameter int PADDR_WIDTH  = 56,
@@ -17,7 +12,10 @@ module nebula_axi_adapter #(
     input  wire                     clk,
     input  wire                     rst_n,
 
-    // I-Cache (512-bit)
+    // Memory L2 Cache Ready signal
+    output logic mem_ready,
+    
+    // I-Cache (512-bit) — tie-off em simulação (imem_req=0)
     input  wire                     imem_req,
     input  wire [PADDR_WIDTH-1:0]   imem_addr,
     output logic                    imem_ack,
@@ -28,15 +26,13 @@ module nebula_axi_adapter #(
     input  wire                     dmem_we,
     input  wire [PADDR_WIDTH-1:0]   dmem_addr,
     input  wire [511:0]             dmem_wdata,
-    
-    // FIX 1: wstrb por beat ampliado para a linha completa (64 bits)
     input  wire [63:0]              dmem_wstrb,
-    input  wire                     dmem_uncached, // Flag MMIO
+    input  wire                     dmem_uncached,
 
     output logic                    dmem_ack,
     output logic [511:0]            dmem_rdata,
 
-    // AXI4 Instruction
+    // AXI4 Instruction (canal I — idle em simulação)
     output logic [AXI_ID_WIDTH-1:0] m_axi_i_arid,
     output logic [PADDR_WIDTH-1:0]  m_axi_i_araddr,
     output logic [7:0]              m_axi_i_arlen,
@@ -50,7 +46,7 @@ module nebula_axi_adapter #(
     input  wire                     m_axi_i_rvalid,
     output logic                    m_axi_i_rready,
 
-    // AXI4 Data
+    // AXI4 Data (canal D — serve I+D em simulação)
     output logic [AXI_ID_WIDTH-1:0] m_axi_d_awid,
     output logic [PADDR_WIDTH-1:0]  m_axi_d_awaddr,
     output logic [7:0]              m_axi_d_awlen,
@@ -82,9 +78,10 @@ module nebula_axi_adapter #(
 );
 
     // =========================================================================
-    // Constantes AXI fixas (burst de 8 beats de 64 bits = 512 bits)
+    // Constantes AXI — burst de 8 beats de 64 bits = 512 bits por transação
     // =========================================================================
-    localparam logic [7:0]  AXI_LEN   = 8'd7;       // FIX 3: 8 beats (0-indexed)
+    localparam logic [7:0]  AXI_LEN_BURST = 8'd7;   // 8 beats (0-indexed)
+    localparam logic [7:0]  AXI_LEN_SINGLE = 8'd0;  // 1 beat (MMIO)
     localparam logic [2:0]  AXI_SIZE  = 3'b011;     // 8 bytes por beat
     localparam logic [1:0]  AXI_BURST = 2'b01;      // INCR
 
@@ -94,9 +91,9 @@ module nebula_axi_adapter #(
     typedef enum logic [2:0] {
         IDLE,
         R_ADDR,
-        R_DATA,   // recebe todos os beats do burst de leitura
+        R_DATA,
         W_ADDR,
-        W_DATA,   // envia todos os beats do burst de escrita
+        W_DATA,
         W_RESP
     } state_t;
 
@@ -104,91 +101,101 @@ module nebula_axi_adapter #(
     // D-Cache FSM
     // =========================================================================
     state_t         d_state;
-    logic [2:0]     d_beat;          // contador de beats 0..7
-    logic [511:0]   d_rbuf;          // buffer de leitura
-    logic [511:0]   d_wbuf_reg;      // linha a escrever (registrada)
-    logic [63:0]    d_wstrb_reg;     // wstrb da requisição (64 bits)
-    logic [PADDR_WIDTH-1:0] d_base;  // endereço base alinhado
+    logic [2:0]     d_beat;
+    logic [511:0]   d_rbuf;
+    logic [511:0]   d_rdata_reg;
+    logic [511:0]   d_wbuf_reg;
+    logic [63:0]    d_wstrb_reg;
+    logic [PADDR_WIDTH-1:0] d_base;
+    logic [2:0]     d_target_beat_reg;
+    logic           d_uncached_reg;
+
+    // Saída da memória
+    assign mem_ready = (d_state == IDLE);
 
     // Saídas fixas do canal D
     assign m_axi_d_arid    = '0;
     assign m_axi_d_awid    = '0;
-    assign m_axi_d_arlen   = dmem_uncached ? 8'h00 : AXI_LEN;
     assign m_axi_d_arsize  = AXI_SIZE;
     assign m_axi_d_arburst = AXI_BURST;
-    
-    // Bypass MMIO: Se uncached, apenas 1 batida. Senão, burst completo.
-    assign m_axi_d_awlen   = dmem_uncached ? 8'h00 : 8'h07;
     assign m_axi_d_awsize  = AXI_SIZE;
     assign m_axi_d_awburst = AXI_BURST;
 
-    // O beat alvo é determinado pelo offset[5:3] do endereço original.
-    logic [2:0] d_target_beat;
-    logic [2:0] d_target_beat_reg;
-    assign d_target_beat = d_base[5:3];  // offset dentro da linha de 64 bytes
+    // Comprimento do burst: 0 para MMIO (1 beat), 7 para cache (8 beats)
+    assign m_axi_d_arlen = d_uncached_reg ? AXI_LEN_SINGLE : AXI_LEN_BURST;
+    assign m_axi_d_awlen = d_uncached_reg ? AXI_LEN_SINGLE : AXI_LEN_BURST;
 
-    // Dado e strobe do beat atual (com suporte a MMIO que busca a palavra exata)
-    wire [63:0] d_wbeat_data = dmem_uncached ? d_wbuf_reg[d_target_beat_reg * 64 +: 64] : d_wbuf_reg[d_beat * 64 +: 64];
-    wire [7:0]  d_wbeat_strb = dmem_uncached ? d_wstrb_reg[d_target_beat_reg * 8 +: 8]  : d_wstrb_reg[d_beat * 8 +: 8];
+    wire [63:0] cur_wdata = d_uncached_reg
+        ? d_wbuf_reg[d_target_beat_reg * 64 +: 64]
+        : d_wbuf_reg[d_beat * 64 +: 64];
 
-    always_comb begin
-        if (dmem_uncached)
-            m_axi_d_wstrb = d_wbeat_strb;
-        else if (d_wstrb_reg == 64'hFFFFFFFFFFFFFFFF || d_beat != d_target_beat_reg)
-            m_axi_d_wstrb = 8'hFF;
-        else
-            m_axi_d_wstrb = d_wbeat_strb;
-    end
+    wire [7:0]  cur_wstrb_raw = d_uncached_reg
+        ? d_wstrb_reg[d_target_beat_reg * 8 +: 8]
+        : d_wstrb_reg[d_beat * 8 +: 8];
 
-    assign m_axi_d_wdata = d_wbeat_data;
-    
-    // Se for MMIO, a primeira batida já é a última!
-    assign m_axi_d_wlast = dmem_uncached ? 1'b1 : (d_beat == 3'd7);
+    // Para burst normal sem wstrb específico (FF = todos bytes válidos)
+    wire [7:0]  cur_wstrb = (!d_uncached_reg && d_wstrb_reg == 64'hFFFFFFFFFFFFFFFF)
+        ? 8'hFF
+        : cur_wstrb_raw;
+
+    assign m_axi_d_wdata = cur_wdata;
+    assign m_axi_d_wstrb = cur_wstrb;
+    assign m_axi_d_wlast = d_uncached_reg ? 1'b1 : (d_beat == 3'd7);
+
+    assign dmem_rdata = d_rdata_reg;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            d_state         <= IDLE;
-            d_beat          <= '0;
-            d_base          <= '0;
-            d_rbuf          <= '0;
-            d_wbuf_reg      <= '0;
-            d_wstrb_reg     <= '0;
-            dmem_ack        <= 1'b0;
-            dmem_rdata      <= '0;
-            m_axi_d_arvalid <= 1'b0;
-            m_axi_d_araddr  <= '0;
-            m_axi_d_rready  <= 1'b0;
-            m_axi_d_awvalid <= 1'b0;
-            m_axi_d_awaddr  <= '0;
-            m_axi_d_wvalid  <= 1'b0;
-            m_axi_d_bready  <= 1'b0;
+            d_state          <= IDLE;
+            d_beat           <= '0;
+            d_base           <= '0;
+            d_rbuf           <= '0;
+            d_rdata_reg      <= '0;
+            d_wbuf_reg       <= '0;
+            d_wstrb_reg      <= '0;
+            d_target_beat_reg <= '0;
+            d_uncached_reg   <= 1'b0;
+            dmem_ack         <= 1'b0;
+            m_axi_d_arvalid  <= 1'b0;
+            m_axi_d_araddr   <= '0;
+            m_axi_d_rready   <= 1'b0;
+            m_axi_d_awvalid  <= 1'b0;
+            m_axi_d_awaddr   <= '0;
+            m_axi_d_wvalid   <= 1'b0;
+            m_axi_d_bready   <= 1'b0;
         end else begin
             dmem_ack <= 1'b0;
+
             case (d_state)
 
                 IDLE: begin
                     d_beat <= '0;
-                    if (dmem_req) begin
-                        d_base            <= {dmem_addr[PADDR_WIDTH-1:6], 6'b0};
-                        d_wbuf_reg        <= dmem_wdata;
-                        d_wstrb_reg       <= dmem_wstrb;
-                        d_target_beat_reg <= dmem_addr[5:3];
-
-                        if (!dmem_we) begin
-                            // Para MMIO passamos o endereço exato
-                            m_axi_d_araddr  <= dmem_uncached ? dmem_addr : {dmem_addr[PADDR_WIDTH-1:6], 6'b0};
-                            m_axi_d_arvalid <= 1'b1;
-                            d_state         <= R_ADDR;
-                        end else begin
-                            // Para MMIO passamos o endereço exato
-                            m_axi_d_awaddr  <= dmem_uncached ? dmem_addr : {dmem_addr[PADDR_WIDTH-1:6], 6'b0};
+                    dmem_ack <= 1'b0;
+                    if (dmem_req && !dmem_ack) begin
+                        if (dmem_we) begin
+                            m_axi_d_awaddr  <= dmem_uncached
+                                ? dmem_addr
+                                : {dmem_addr[PADDR_WIDTH-1:6], 6'b0};
                             m_axi_d_awvalid <= 1'b1;
-                            d_state         <= W_ADDR;
+                            d_state           <= W_ADDR;
+                            d_base            <= {dmem_addr[PADDR_WIDTH-1:6], 6'b0};
+                            d_wbuf_reg        <= dmem_wdata;
+                            d_wstrb_reg       <= dmem_wstrb;
+                            d_target_beat_reg <= dmem_addr[5:3];
+                            d_uncached_reg    <= dmem_uncached;
+                        end else begin
+                            m_axi_d_araddr  <= dmem_uncached
+                                ? dmem_addr
+                                : {dmem_addr[PADDR_WIDTH-1:6], 6'b0};
+                            m_axi_d_arvalid <= 1'b1;
+                            d_uncached_reg  <= dmem_uncached;
+                            d_target_beat_reg <= dmem_addr[5:3];
+                            d_state         <= R_ADDR;
                         end
                     end
                 end
 
-                // --- Leitura ---
+                // --- Canal de Leitura ---
                 R_ADDR: begin
                     if (m_axi_d_arready) begin
                         m_axi_d_arvalid <= 1'b0;
@@ -197,33 +204,41 @@ module nebula_axi_adapter #(
                     end
                 end
 
-                // Recebe burst de 8 beats em R_DATA sincronizado
                 R_DATA: begin
                     if (m_axi_d_rvalid) begin
-                        // Captura o beat atual para o buffer
-                        d_rbuf[d_beat * 64 +: 64] <= m_axi_d_rdata; 
-                        
+                        d_rbuf[d_beat * 64 +: 64] <= m_axi_d_rdata;
+
                         if (m_axi_d_rlast) begin
                             m_axi_d_rready <= 1'b0;
-                            dmem_rdata     <= dmem_uncached ?
-                                                {8{m_axi_d_rdata}} : 
-                                                {m_axi_d_rdata,
-                                                d_rbuf[6*64 +: 64],
-                                                d_rbuf[5*64 +: 64],
-                                                d_rbuf[4*64 +: 64],
-                                                d_rbuf[3*64 +: 64],
-                                                d_rbuf[2*64 +: 64],
-                                                d_rbuf[1*64 +: 64],
-                                                d_rbuf[0*64 +: 64]};
-                            dmem_ack <= 1'b1;
-                            d_state  <= IDLE;
+                            dmem_ack       <= 1'b1;
+                            d_state        <= IDLE;
+                            d_beat         <= '0;
+
+                            if (d_uncached_reg) begin
+                                d_rdata_reg <= {8{m_axi_d_rdata}};
+                            end else begin
+                                // Montar a linha de 512 bits.
+                                // d_beat neste ponto é o índice do ÚLTIMO beat (7).
+                                // Os beats 0..6 já estão em d_rbuf (registrados
+                                // em ciclos anteriores). O beat 7 é m_axi_d_rdata.
+                                d_rdata_reg <= {
+                                    (d_beat == 3'd7) ? m_axi_d_rdata : d_rbuf[7*64 +: 64],
+                                    (d_beat == 3'd6) ? m_axi_d_rdata : d_rbuf[6*64 +: 64],
+                                    (d_beat == 3'd5) ? m_axi_d_rdata : d_rbuf[5*64 +: 64],
+                                    (d_beat == 3'd4) ? m_axi_d_rdata : d_rbuf[4*64 +: 64],
+                                    (d_beat == 3'd3) ? m_axi_d_rdata : d_rbuf[3*64 +: 64],
+                                    (d_beat == 3'd2) ? m_axi_d_rdata : d_rbuf[2*64 +: 64],
+                                    (d_beat == 3'd1) ? m_axi_d_rdata : d_rbuf[1*64 +: 64],
+                                    (d_beat == 3'd0) ? m_axi_d_rdata : d_rbuf[0*64 +: 64]
+                                };
+                            end
                         end else begin
                             d_beat <= d_beat + 1;
                         end
                     end
                 end
 
-                // --- Escrita ---
+                // --- Canal de Escrita ---
                 W_ADDR: begin
                     if (m_axi_d_awready) begin
                         m_axi_d_awvalid <= 1'b0;
@@ -232,16 +247,23 @@ module nebula_axi_adapter #(
                     end
                 end
 
-                // FIX 3: envia burst de 8 beats em W_DATA (wlast no beat 7)
-                // FIX 2: beat avança SOMENTE quando wready é aceito
                 W_DATA: begin
                     if (m_axi_d_wready) begin
+                        // BUG 2 FIX: wlast é calculado combinacionalmente
+                        // como (d_beat == 7). Quando wready=1 e d_beat=7,
+                        // wlast=1 está sendo apresentado NESTE ciclo com
+                        // wdata=beat7. O incremento de d_beat (para 8)
+                        // acontece no always_ff APÓS este ciclo — o slave
+                        // já viu wlast=1 com o dado correto.
                         if (m_axi_d_wlast) begin
+                            // Último beat aceito — aguardar B channel
                             m_axi_d_wvalid <= 1'b0;
                             m_axi_d_bready <= 1'b1;
+                            d_beat         <= '0;
                             d_state        <= W_RESP;
                         end else begin
-                            d_beat <= d_beat + 1; // FIX 2: incremento aqui
+                            // Avançar para o próximo beat
+                            d_beat <= d_beat + 1;
                         end
                     end
                 end
@@ -250,7 +272,6 @@ module nebula_axi_adapter #(
                     if (m_axi_d_bvalid) begin
                         m_axi_d_bready <= 1'b0;
                         dmem_ack       <= 1'b1;
-                        d_beat         <= '0;
                         d_state        <= IDLE;
                     end
                 end
@@ -261,18 +282,22 @@ module nebula_axi_adapter #(
     end
 
     // =========================================================================
-    // I-Cache FSM (mesma estrutura — burst de 8 beats de leitura)
+    // I-Cache FSM — burst de 8 beats de leitura
     // D-Cache tem prioridade: I-Cache só inicia quando D está IDLE.
+    // Em simulação LiteX, imem_req=0 hardcoded no top — esta FSM fica idle.
     // =========================================================================
     state_t         i_state;
     logic [2:0]     i_beat;
     logic [511:0]   i_rbuf;
+    logic [511:0]   i_rdata_reg;
     logic [PADDR_WIDTH-1:0] i_base;
 
     assign m_axi_i_arid    = '0;
-    assign m_axi_i_arlen   = AXI_LEN;
+    assign m_axi_i_arlen   = AXI_LEN_BURST;
     assign m_axi_i_arsize  = AXI_SIZE;
     assign m_axi_i_arburst = AXI_BURST;
+
+    assign imem_data = i_rdata_reg;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -280,13 +305,14 @@ module nebula_axi_adapter #(
             i_beat          <= '0;
             i_base          <= '0;
             i_rbuf          <= '0;
+            i_rdata_reg     <= '0;
             imem_ack        <= 1'b0;
-            imem_data       <= '0;
             m_axi_i_arvalid <= 1'b0;
             m_axi_i_araddr  <= '0;
             m_axi_i_rready  <= 1'b0;
         end else begin
             imem_ack <= 1'b0;
+
             case (i_state)
 
                 IDLE: begin
@@ -311,18 +337,23 @@ module nebula_axi_adapter #(
                 R_DATA: begin
                     if (m_axi_i_rvalid) begin
                         i_rbuf[i_beat * 64 +: 64] <= m_axi_i_rdata;
+
                         if (m_axi_i_rlast) begin
                             m_axi_i_rready <= 1'b0;
-                            imem_data      <= {m_axi_i_rdata,
-                                              i_rbuf[6*64 +: 64],
-                                              i_rbuf[5*64 +: 64],
-                                              i_rbuf[4*64 +: 64],
-                                              i_rbuf[3*64 +: 64],
-                                              i_rbuf[2*64 +: 64],
-                                              i_rbuf[1*64 +: 64],
-                                              i_rbuf[0*64 +: 64]};
-                            imem_ack <= 1'b1;
-                            i_state  <= IDLE;
+                            imem_ack       <= 1'b1;
+                            i_state        <= IDLE;
+                            i_beat         <= '0;
+                            // Montar linha de 512 bits (mesmo padrão do canal D)
+                            i_rdata_reg <= {
+                                (i_beat == 3'd7) ? m_axi_i_rdata : i_rbuf[7*64 +: 64],
+                                (i_beat == 3'd6) ? m_axi_i_rdata : i_rbuf[6*64 +: 64],
+                                (i_beat == 3'd5) ? m_axi_i_rdata : i_rbuf[5*64 +: 64],
+                                (i_beat == 3'd4) ? m_axi_i_rdata : i_rbuf[4*64 +: 64],
+                                (i_beat == 3'd3) ? m_axi_i_rdata : i_rbuf[3*64 +: 64],
+                                (i_beat == 3'd2) ? m_axi_i_rdata : i_rbuf[2*64 +: 64],
+                                (i_beat == 3'd1) ? m_axi_i_rdata : i_rbuf[1*64 +: 64],
+                                (i_beat == 3'd0) ? m_axi_i_rdata : i_rbuf[0*64 +: 64]
+                            };
                         end else begin
                             i_beat <= i_beat + 1;
                         end
@@ -351,5 +382,6 @@ module nebula_axi_adapter #(
             $display("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
         end
     end
+    // synthesis translate_on
 
 endmodule
