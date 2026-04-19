@@ -6,6 +6,27 @@ import nebula_pkg::*;
 /**
  * @module nebula_cluster
  * @brief Cluster de 4 núcleos Nebula com L2 compartilhado
+ *
+ * CORREÇÕES APLICADAS:
+ *
+ * BUG 3 FIX — mmio_req_r removido; bypass MMIO agora puramente combinacional.
+ *
+ *   Antes: mmio_req_r era um FF com enable mem_ready. Com o fix do Bug 1,
+ *   mem_ready passou a pulsar apenas no handshake AXI (arready/awready),
+ *   nunca quando o adapter estava idle aguardando nova requisição.
+ *   Consequência: quando um acesso MMIO chegava, mem_ready=0 (adapter idle
+ *   não gera pulso), o FF nunca capturava mmio_req_r=1, o mux apontava
+ *   para l2_mem_req (zero) e a D-Cache ficava presa em S_MMIO_WAIT
+ *   esperando um mem_ack que nunca chegava.
+ *
+ *   Depois: o bypass MMIO é puramente combinacional via wire mmio_req.
+ *   A D-Cache já mantém mem_req=1 e mem_uncached=1 estáveis durante
+ *   todo o S_MMIO_REQ + S_MMIO_WAIT — o wire reflete isso diretamente
+ *   sem precisar de nenhum registrador intermediário.
+ *
+ *   Adicionado port mem_idle do adapter (novo) conectado ao top.
+ *   mem_idle não é usado internamente no cluster mas está disponível
+ *   para debug e extensões futuras.
  */
 module nebula_cluster #(
     parameter int CLUSTER_ID    = 0,
@@ -35,6 +56,10 @@ module nebula_cluster #(
     input  wire [L2_LINE_SIZE*8-1:0]  mem_rdata,
     input  wire                       mem_error,
     input  wire                       mem_ready,
+
+    // BUG 3 FIX: mem_idle vem do adapter (d_state == IDLE).
+    // Não é usado internamente mas está disponível para o top e debug.
+    input  wire                       mem_idle,
 
     input  wire [NUM_CORES-1:0]       timer_irq,
     input  wire [NUM_CORES-1:0]       external_irq,
@@ -78,6 +103,14 @@ module nebula_cluster #(
     logic [XLEN-1:0]           ptw_mem_wdata [NUM_CORES];
     logic                      ptw_mem_ack   [NUM_CORES];
     logic [XLEN-1:0]           ptw_mem_data  [NUM_CORES];
+
+    // =========================================================================
+    // BUG 3 FIX: bypass MMIO puramente combinacional.
+    // A D-Cache mantém l1d_l2_req[0]=1 e l1d_uncached[0]=1 estáveis
+    // durante S_MMIO_REQ e S_MMIO_WAIT. O wire reflete isso diretamente.
+    // Sem registrador intermediário — nenhuma dependência de mem_ready.
+    // =========================================================================
+    wire mmio_req = l1d_l2_req[0] && l1d_uncached[0];
 
     // =========================================================================
     // Core Instances
@@ -144,20 +177,21 @@ module nebula_cluster #(
 
                 if (ptw_mem_req[c] && ptw_mem_we[c]) begin
                     // PTW write (A/D writeback) — máxima prioridade
-                    core_l2_req[c].valid   = 1'b1;
-                    core_l2_req[c].core_id = c[$clog2(NUM_CORES)-1:0];
+                    core_l2_req[c].valid     = 1'b1;
+                    core_l2_req[c].core_id   = c[$clog2(NUM_CORES)-1:0];
                     core_l2_req[c].is_ifetch = 1'b0;
                     core_l2_req[c].is_write  = 1'b1;
                     core_l2_req[c].is_amo    = 1'b0;
                     core_l2_req[c].amo_op    = '0;
                     core_l2_req[c].addr      = ptw_mem_addr[c];
-                    // Empacotar 64-bit write em linha de cache (posição 0)
                     core_l2_req[c].wdata     = {'0, ptw_mem_wdata[c]};
                     core_l2_req[c].upgrade   = 1'b0;
                 end
                 else if (l1d_l2_req[c] && !l1d_uncached[c]) begin
-                    core_l2_req[c].valid    = 1'b1;
-                    core_l2_req[c].core_id  = c[$clog2(NUM_CORES)-1:0];
+                    // BUG 3 FIX: acessos uncached NÃO entram na L2.
+                    // Eles vão direto para o adapter via mmio_req combinacional.
+                    core_l2_req[c].valid     = 1'b1;
+                    core_l2_req[c].core_id   = c[$clog2(NUM_CORES)-1:0];
                     core_l2_req[c].is_ifetch = 1'b0;
                     core_l2_req[c].is_write  = l1d_l2_we[c];
                     core_l2_req[c].is_amo    = l1d_l2_is_amo[c];
@@ -167,8 +201,8 @@ module nebula_cluster #(
                     core_l2_req[c].upgrade   = l1d_l2_upgrade[c];
                 end
                 else if (l1i_l2_req[c]) begin
-                    core_l2_req[c].valid    = 1'b1;
-                    core_l2_req[c].core_id  = c[$clog2(NUM_CORES)-1:0];
+                    core_l2_req[c].valid     = 1'b1;
+                    core_l2_req[c].core_id   = c[$clog2(NUM_CORES)-1:0];
                     core_l2_req[c].is_ifetch = 1'b1;
                     core_l2_req[c].is_write  = 1'b0;
                     core_l2_req[c].is_amo    = 1'b0;
@@ -179,8 +213,8 @@ module nebula_cluster #(
                 end
                 else if (ptw_mem_req[c] && !ptw_mem_we[c]) begin
                     // PTW read — menor prioridade que D-Cache
-                    core_l2_req[c].valid    = 1'b1;
-                    core_l2_req[c].core_id  = c[$clog2(NUM_CORES)-1:0];
+                    core_l2_req[c].valid     = 1'b1;
+                    core_l2_req[c].core_id   = c[$clog2(NUM_CORES)-1:0];
                     core_l2_req[c].is_ifetch = 1'b0;
                     core_l2_req[c].is_write  = 1'b0;
                     core_l2_req[c].addr      = ptw_mem_addr[c];
@@ -189,18 +223,24 @@ module nebula_cluster #(
 
             // =================================================================
             // Rotear respostas L2 de volta para L1 / PTW
+            //
+            // BUG 3 FIX: substituído mmio_req_r (FF) por mmio_req (wire
+            // combinacional) nas linhas de ack e rdata da D-Cache.
             // =================================================================
             always_comb begin
                 l1i_l2_ack[c]  = core_l2_resp[c].valid && core_l2_resp[c].is_ifetch;
                 l1i_l2_data[c] = core_l2_resp[c].rdata;
 
-                // D-Cache ack: resposta não-ifetch e PTW não está fazendo write
-                l1d_l2_ack[c] = (c == 0 && mmio_req_r) ? mem_ack :
+                // D-Cache ack: MMIO vai direto via mem_ack; cache passa pela L2
+                l1d_l2_ack[c] = (c == 0 && mmio_req) ? mem_ack :
                     (core_l2_resp[c].valid &&
-                    !core_l2_resp[c].is_ifetch &&
-                    !(ptw_mem_req[c] && ptw_mem_we[c]));
-                                  
-                l1d_l2_rdata[c] = (c == 0 && mmio_req_r) ? mem_rdata : core_l2_resp[c].rdata;
+                     !core_l2_resp[c].is_ifetch &&
+                     !(ptw_mem_req[c] && ptw_mem_we[c]));
+
+                // D-Cache rdata: MMIO retorna mem_rdata; cache retorna da L2
+                l1d_l2_rdata[c] = (c == 0 && mmio_req) ? mem_rdata
+                                                        : core_l2_resp[c].rdata;
+
                 // PTW ack: qualquer resposta enquanto PTW tem pedido pendente
                 ptw_mem_ack[c] = core_l2_resp[c].valid && ptw_mem_req[c];
 
@@ -222,32 +262,33 @@ module nebula_cluster #(
     endgenerate
 
     // =========================================================================
-    // L2 Bypass para MMIO (Uncached) - Roteamento direto para o AXI
+    // L2 Bypass para MMIO (Uncached) — Roteamento direto para o AXI
+    //
+    // BUG 3 FIX: removido o always_ff com mmio_req_r.
+    //
+    // O mux de mem_req/mem_addr/etc agora usa mmio_req combinacional.
+    // Quando mmio_req=1 (D-Cache em S_MMIO_REQ ou S_MMIO_WAIT):
+    //   - mem_req      = l1d_l2_req[0]   (=1, mantido pela D-Cache)
+    //   - mem_uncached = 1
+    //   - mem_addr     = endereço MMIO
+    //   - l2_mem_ack   = 0 (a L2 não tem requisição pendente)
+    //
+    // Quando mmio_req=0 (acesso normal à L2):
+    //   - mem_req      = l2_mem_req  (vem da L2)
+    //   - mem_uncached = 0
+    //   - l2_mem_ack   = mem_ack     (repassado para a L2)
     // =========================================================================
     logic l2_mem_req, l2_mem_we, l2_mem_ack;
-    logic [PADDR_WIDTH-1:0] l2_mem_addr;
+    logic [PADDR_WIDTH-1:0]    l2_mem_addr;
     logic [L2_LINE_SIZE*8-1:0] l2_mem_wdata;
 
-    logic mmio_req_r;
-
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            mmio_req_r <= 1'b0;
-        else if (mem_ready)  // só atualiza quando adapter está livre
-            mmio_req_r <= l1d_l2_req[0] && l1d_uncached[0];
-    end
-
-    // Usar mmio_req_r no mux:
-    assign mem_req      = mmio_req_r ? l1d_l2_req[0]  : l2_mem_req;
-    assign mem_we       = mmio_req_r ? l1d_l2_we[0]   : l2_mem_we;
-    assign mem_addr     = mmio_req_r ? l1d_l2_addr[0] : l2_mem_addr;
-    assign mem_wdata    = mmio_req_r ? l1d_l2_wdata[0]: l2_mem_wdata;
-    assign mem_wstrb    = mmio_req_r ? l1d_l2_wstrb[0]: {L2_LINE_SIZE{1'b1}};
-    assign mem_uncached = mmio_req_r;
-    assign l2_mem_ack   = mmio_req_r ? 1'b0 : mem_ack;
-
-    // manter mmio_req combinacional só para o ack do L1D:
-    wire mmio_req = l1d_l2_req[0] && l1d_uncached[0];
+    assign mem_req      = mmio_req ? l1d_l2_req[0]   : l2_mem_req;
+    assign mem_we       = mmio_req ? l1d_l2_we[0]    : l2_mem_we;
+    assign mem_addr     = mmio_req ? l1d_l2_addr[0]  : l2_mem_addr;
+    assign mem_wdata    = mmio_req ? l1d_l2_wdata[0] : l2_mem_wdata;
+    assign mem_wstrb    = mmio_req ? l1d_l2_wstrb[0] : {L2_LINE_SIZE{1'b1}};
+    assign mem_uncached = mmio_req;
+    assign l2_mem_ack   = mmio_req ? 1'b0 : mem_ack;
 
     // =========================================================================
     // L2 Cache
@@ -258,9 +299,12 @@ module nebula_cluster #(
         .SIZE_KB(L2_SIZE_KB), .NUM_BANKS(L2_BANKS)
     ) u_l2_cache (
         .clk, .rst_n,
-        .l1_req(core_l2_req), .l1_resp(core_l2_resp), .snoop_req, .snoop_resp,
-        .mem_req(l2_mem_req), .mem_we(l2_mem_we), .mem_addr(l2_mem_addr), .mem_wdata(l2_mem_wdata),
-        .mem_ack(l2_mem_ack), .mem_rdata, .mem_error, .mem_ready(mem_ready)
+        .l1_req(core_l2_req), .l1_resp(core_l2_resp),
+        .snoop_req, .snoop_resp,
+        .mem_req(l2_mem_req), .mem_we(l2_mem_we),
+        .mem_addr(l2_mem_addr), .mem_wdata(l2_mem_wdata),
+        .mem_ack(l2_mem_ack), .mem_rdata, .mem_error,
+        .mem_ready(mem_ready)
     );
 
 endmodule

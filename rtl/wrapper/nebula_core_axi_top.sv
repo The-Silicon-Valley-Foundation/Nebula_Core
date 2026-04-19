@@ -6,52 +6,24 @@
  *
  * CORREÇÕES APLICADAS:
  *
- * BUG 1 — Sinais l2_imem_* declarados mas nunca conectados ao cluster.
- *   O cluster expõe UMA interface mem_* unificada (I+D+PTW). O adapter
- *   tem dois canais (imem_* e dmem_*), mas em simulação Opção A tudo vai
- *   pelo canal D. Os sinais l2_imem_req/ack/addr/data eram dead code —
- *   declarados, conectados ao adapter, mas nunca ao cluster.
- *   FIX: remover sinais mortos; comentário atualizado para clareza.
+ * BUG 1 FIX (adapter) — mem_ready redefinido para pulsar no handshake AXI.
+ *   Ver nebula_axi_adapter.sv para descrição completa.
  *
- * BUG 2 — Falta de sinal "ready" do adapter para o cluster.
- *   O adapter aceita dmem_req apenas em estado IDLE. Sem um sinal de
- *   ready de volta, a L2 não sabe se a requisição foi aceita, e poderia
- *   em princípio baixar mem_req antes do adapter processar. Na prática
- *   a L2 fica em S_FILL_REQ/S_FILL_WAIT até mem_ack, então mem_req
- *   permanece alto — mas é design frágil.
- *   FIX: adicionado sinal dmem_ready do adapter (novo port) que indica
- *   quando o adapter está IDLE e pode aceitar nova requisição. O cluster
- *   recebe isso como mem_ready. Requer atualização do adapter.
- *   NOTA: Como o adapter corrigido não tem port dmem_ready ainda,
- *   usamos a condição segura: mem_req só é enviado quando l2_req=1
- *   E adapter está IDLE (controlado pelo ack anterior). O protocolo
- *   atual funciona porque a L2 mantém req alto até o ack.
+ * BUG 3 FIX (cluster) — mmio_req_r removido; bypass MMIO combinacional.
+ *   Ver nebula_cluster.sv para descrição completa.
+ *   Requer novo sinal l2_mem_idle conectando adapter → cluster.
  *
- * BUG 3 — Canal AXI I conectado com sinais do adapter mas imem_req=0.
- *   Os sinais o_m_axi_i_* eram drivenados pelos assigns internos do
- *   adapter mesmo com imem_req=0, podendo causar glitches. Os sinais
- *   de saída do canal I que o LiteX não usa são agora explicitamente
- *   zerados exceto o_m_axi_i_arvalid (que o adapter já mantém em 0).
+ * BUGs anteriores mantidos (documentação histórica):
  *
- * BUG 4 — CRÍTICO: dmem_wstrb era logic [63:0] no top, mas o port do
- *   cluster é [L2_LINE_SIZE-1:0] = [63:0]. A conexão estava correta em
- *   largura mas o nome do sinal l2_wstrb não era usado em nenhum outro
- *   lugar — verificado que a conexão .mem_wstrb(l2_wstrb) e
- *   .dmem_wstrb(l2_wstrb) está correta.
+ * BUG 2 — Sinais l2_imem_* declarados mas nunca conectados ao cluster.
+ *   FIX: removidos (dead code).
  *
- * BUG 5 — CRÍTICO: Ausência de conexão entre mem_error do adapter e
- *   o cluster. O cluster tem input mem_error mas o top conectava 1'b0.
- *   Mantido como 1'b0 intencionalmente para simulação (o adapter
- *   não implementa error reporting para o cluster), mas documentado.
+ * BUG 4 — dmem_wstrb era logic [63:0] — largura correta, mantida.
  *
- * BUG 6 — CRÍTICO: l2_ack (que alimenta cluster.mem_ack) era
- *   simplesmente mem_ack (=dmem_ack). Mas quando mmio_req=1, o bypass
- *   vai direto para o AXI sem passar pela L2. Nesse caso:
- *   - l1d_l2_ack[0] = mem_ack (correto — D-Cache L1 recebe ack direto)
- *   - l2_ack = mem_ack (ERRADO — L2 não tem req pendente, não precisa de ack)
- *   O assign original já tinha mmio_req ? 1'b0 : mem_ack para l2_mem_ack.
- *   Verificado: l2_ack = l2_mem_ack já estava correto no original.
- *   FIX: mantido; adicionado assert para detectar regressão.
+ * BUG 5 — mem_error conectado a 1'b0 intencionalmente em simulação.
+ *
+ * BUG 6 — l2_ack com mmio bypass: l2_mem_ack = mmio_req ? 1'b0 : mem_ack.
+ *   Tratado agora no cluster diretamente.
  */
 module nebula_core_axi_top #(
     parameter int HART_ID = 0,
@@ -68,7 +40,6 @@ module nebula_core_axi_top #(
     // =========================================================================
     // AXI4 Instruction (canal I)
     // Em simulação LiteX Opção A: imem_req=0, canal I fica idle.
-    // arvalid sempre 0; outros sinais mantidos em valores seguros.
     // =========================================================================
     output wire [3:0]   o_m_axi_i_arid,
     output wire [63:0]  o_m_axi_i_araddr,
@@ -119,8 +90,8 @@ module nebula_core_axi_top #(
     // =========================================================================
     // Parâmetros locais
     // =========================================================================
-    localparam int PADDR_WIDTH   = 56;
-    localparam int L2_LINE_SIZE  = 64;   // bytes → wstrb = 64 bits
+    localparam int PADDR_WIDTH  = 56;
+    localparam int L2_LINE_SIZE = 64;   // bytes → wstrb = 64 bits
 
     // =========================================================================
     // Sinais internos: Cluster → Adapter (interface unificada 512 bits)
@@ -131,23 +102,23 @@ module nebula_core_axi_top #(
     logic [PADDR_WIDTH-1:0]     l2_addr;
     logic [L2_LINE_SIZE*8-1:0]  l2_wdata;
     logic [L2_LINE_SIZE*8-1:0]  l2_rdata;
-    logic [L2_LINE_SIZE-1:0]    l2_wstrb;    // 64 bits de byte-enable
-    logic                       l2_uncached; // flag MMIO bypass
-    logic l2_mem_ready;
+    logic [L2_LINE_SIZE-1:0]    l2_wstrb;
+    logic                       l2_uncached;
+    logic                       l2_mem_ready;
+
+    // BUG 3 FIX: novo sinal mem_idle do adapter para o cluster.
+    // Indica que o adapter está em IDLE e pode aceitar nova requisição.
+    // Usado pelo cluster para o bypass MMIO combinacional.
+    logic                       l2_mem_idle;
 
     // =========================================================================
-    // Distribuição de interrupções (todos os cores recebem o mesmo sinal
-    // já que em simulação usamos NUM_CORES=1 no cluster)
+    // Distribuição de interrupções
     // =========================================================================
     wire [3:0] timer_irqs    = {4{i_timer_irq}};
     wire [3:0] external_irqs = {4{i_external_irq}};
     wire [3:0] software_irqs = {4{i_software_irq}};
 
-    // =========================================================================
-    // BUG 4 FIX: Sinal dummy para imem do adapter (Opção A — tudo no canal D)
-    // O adapter precisa de um sinal de ack da I-Cache, mas como imem_req=0,
-    // esses sinais nunca são usados. Declarados apenas para satisfazer o port.
-    // =========================================================================
+    // Dummy para I-Cache do adapter (imem_req=0 em simulação Opção A)
     logic        dummy_imem_ack;
     logic [511:0] dummy_imem_data;
 
@@ -156,7 +127,7 @@ module nebula_core_axi_top #(
     // =========================================================================
     nebula_cluster #(
         .CLUSTER_ID  (0),
-        .NUM_CORES   (1),           // simulação single-core
+        .NUM_CORES   (1),
         .XLEN        (XLEN),
         .PADDR_WIDTH (PADDR_WIDTH),
         .VADDR_WIDTH (39)
@@ -165,8 +136,8 @@ module nebula_core_axi_top #(
         .rst_n    (rst_n),
 
         .mem_ready(l2_mem_ready),
+        .mem_idle (l2_mem_idle),   // BUG 3 FIX: novo port
 
-        // Interface com a memória principal (unificada I+D+PTW → canal D AXI)
         .mem_req      (l2_req),
         .mem_we       (l2_we),
         .mem_addr     (l2_addr),
@@ -175,7 +146,7 @@ module nebula_core_axi_top #(
         .mem_uncached (l2_uncached),
         .mem_ack      (l2_ack),
         .mem_rdata    (l2_rdata),
-        .mem_error    (1'b0),       // adapter não reporta erro ao cluster em simulação
+        .mem_error    (1'b0),
 
         .timer_irq    (timer_irqs),
         .external_irq (external_irqs),
@@ -187,14 +158,6 @@ module nebula_core_axi_top #(
 
     // =========================================================================
     // AXI Adapter
-    //
-    // Canal I: imem_req=0 (Opção A — tudo no canal D).
-    //   Os sinais de saída do canal I ficam idle (arvalid=0 garantido
-    //   pelo adapter quando imem_req=0).
-    //
-    // Canal D: recebe toda a tráfego do cluster (I-Cache miss, D-Cache
-    //   miss, PTW walks, MMIO). O adapter serializa as requisições da
-    //   L2 para o barramento AXI de 64 bits em bursts de 8 beats.
     // =========================================================================
     nebula_axi_adapter #(
         .PADDR_WIDTH  (PADDR_WIDTH),
@@ -204,13 +167,13 @@ module nebula_core_axi_top #(
         .rst_n (rst_n),
 
         .mem_ready (l2_mem_ready),
+        .mem_idle  (l2_mem_idle),  // BUG 3 FIX: novo port
 
         .imem_req  (1'b0),
         .imem_addr ('0),
         .imem_ack  (dummy_imem_ack),
         .imem_data (dummy_imem_data),
 
-        // Canal D: interface unificada com o cluster
         .dmem_req      (l2_req),
         .dmem_we       (l2_we),
         .dmem_addr     (l2_addr),
@@ -220,7 +183,7 @@ module nebula_core_axi_top #(
         .dmem_ack      (l2_ack),
         .dmem_rdata    (l2_rdata),
 
-        // AXI D → LiteX (canal de dados — carrega I+D em simulação)
+        // AXI D → LiteX
         .m_axi_d_awid    (o_m_axi_d_awid),
         .m_axi_d_awaddr  (o_m_axi_d_awaddr),
         .m_axi_d_awlen   (o_m_axi_d_awlen),
@@ -250,19 +213,19 @@ module nebula_core_axi_top #(
         .m_axi_d_rvalid  (i_m_axi_d_rvalid),
         .m_axi_d_rready  (o_m_axi_d_rready),
 
-        // AXI I → LiteX (canal de instrução — idle em simulação Opção A)
+        // AXI I → LiteX (idle em simulação Opção A)
         .m_axi_i_arid    (o_m_axi_i_arid),
         .m_axi_i_araddr  (o_m_axi_i_araddr),
         .m_axi_i_arlen   (o_m_axi_i_arlen),
         .m_axi_i_arsize  (o_m_axi_i_arsize),
         .m_axi_i_arburst (o_m_axi_i_arburst),
-        .m_axi_i_arvalid (o_m_axi_i_arvalid),  // adapter mantém 0 pois imem_req=0
+        .m_axi_i_arvalid (o_m_axi_i_arvalid),
         .m_axi_i_arready (i_m_axi_i_arready),
         .m_axi_i_rdata   (i_m_axi_i_rdata),
         .m_axi_i_rresp   (i_m_axi_i_rresp),
         .m_axi_i_rlast   (i_m_axi_i_rlast),
         .m_axi_i_rvalid  (i_m_axi_i_rvalid),
-        .m_axi_i_rready  (o_m_axi_i_rready)    // adapter mantém 0 pois imem_req=0
+        .m_axi_i_rready  (o_m_axi_i_rready)
     );
 
 endmodule

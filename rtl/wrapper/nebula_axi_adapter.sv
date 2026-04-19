@@ -4,6 +4,21 @@
  * @module nebula_axi_adapter
  * @brief Adaptador Nebula (512-bit) <-> AXI4 (64-bit)
  *
+ * CORREÇÕES APLICADAS:
+ *
+ * BUG 1 FIX — mem_ready redefinido.
+ *   Antes: assign mem_ready = (d_state == IDLE)
+ *   O problema: quando a L2 entrava em S_FILL_REQ, o adapter já havia
+ *   saído de IDLE (estava em R_ADDR ou R_DATA), então mem_ready=0
+ *   permanentemente durante toda a transação. A L2 ficava presa em
+ *   S_FILL_REQ esperando mem_ready=1 que nunca vinha → deadlock (estado 8).
+ *
+ *   Depois: mem_ready pulsa por 1 ciclo quando o handshake AXI é aceito
+ *   (arready ou awready). Isso sinaliza para a L2 que a requisição foi
+ *   encaminhada ao barramento — a L2 pode avançar para S_FILL_WAIT.
+ *
+ *   Adicionado também mem_idle (d_state == IDLE) como saída separada,
+ *   para uso do cluster no bypass MMIO (Bug 3).
  */
 module nebula_axi_adapter #(
     parameter int PADDR_WIDTH  = 56,
@@ -12,9 +27,11 @@ module nebula_axi_adapter #(
     input  wire                     clk,
     input  wire                     rst_n,
 
-    // Memory L2 Cache Ready signal
+    // BUG 1 FIX: mem_ready agora pulsa no handshake AXI (arready/awready).
+    // mem_idle indica que o adapter está livre para aceitar nova requisição.
     output logic mem_ready,
-    
+    output logic mem_idle,
+
     // I-Cache (512-bit) — tie-off em simulação (imem_req=0)
     input  wire                     imem_req,
     input  wire [PADDR_WIDTH-1:0]   imem_addr,
@@ -80,10 +97,10 @@ module nebula_axi_adapter #(
     // =========================================================================
     // Constantes AXI — burst de 8 beats de 64 bits = 512 bits por transação
     // =========================================================================
-    localparam logic [7:0]  AXI_LEN_BURST = 8'd7;   // 8 beats (0-indexed)
+    localparam logic [7:0]  AXI_LEN_BURST  = 8'd7;  // 8 beats (0-indexed)
     localparam logic [7:0]  AXI_LEN_SINGLE = 8'd0;  // 1 beat (MMIO)
-    localparam logic [2:0]  AXI_SIZE  = 3'b011;     // 8 bytes por beat
-    localparam logic [1:0]  AXI_BURST = 2'b01;      // INCR
+    localparam logic [2:0]  AXI_SIZE       = 3'b011; // 8 bytes por beat
+    localparam logic [1:0]  AXI_BURST      = 2'b01;  // INCR
 
     // =========================================================================
     // FSM
@@ -110,8 +127,15 @@ module nebula_axi_adapter #(
     logic [2:0]     d_target_beat_reg;
     logic           d_uncached_reg;
 
-    // Saída da memória
-    assign mem_ready = (d_state == IDLE);
+    // =========================================================================
+    // BUG 1 FIX: mem_ready sinaliza handshake AXI aceito (não IDLE).
+    // A L2 usa mem_ready para sair de S_FILL_REQ → S_FILL_WAIT.
+    // mem_idle é usado pelo cluster para saber quando o adapter pode
+    // aceitar uma nova requisição MMIO (Bug 3 fix no cluster).
+    // =========================================================================
+    assign mem_idle  = (d_state == IDLE);
+    assign mem_ready = (d_state == R_ADDR && m_axi_d_arready) ||
+                       (d_state == W_ADDR && m_axi_d_awready);
 
     // Saídas fixas do canal D
     assign m_axi_d_arid    = '0;
@@ -146,37 +170,37 @@ module nebula_axi_adapter #(
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            d_state          <= IDLE;
-            d_beat           <= '0;
-            d_base           <= '0;
-            d_rbuf           <= '0;
-            d_rdata_reg      <= '0;
-            d_wbuf_reg       <= '0;
-            d_wstrb_reg      <= '0;
+            d_state           <= IDLE;
+            d_beat            <= '0;
+            d_base            <= '0;
+            d_rbuf            <= '0;
+            d_rdata_reg       <= '0;
+            d_wbuf_reg        <= '0;
+            d_wstrb_reg       <= '0;
             d_target_beat_reg <= '0;
-            d_uncached_reg   <= 1'b0;
-            dmem_ack         <= 1'b0;
-            m_axi_d_arvalid  <= 1'b0;
-            m_axi_d_araddr   <= '0;
-            m_axi_d_rready   <= 1'b0;
-            m_axi_d_awvalid  <= 1'b0;
-            m_axi_d_awaddr   <= '0;
-            m_axi_d_wvalid   <= 1'b0;
-            m_axi_d_bready   <= 1'b0;
+            d_uncached_reg    <= 1'b0;
+            dmem_ack          <= 1'b0;
+            m_axi_d_arvalid   <= 1'b0;
+            m_axi_d_araddr    <= '0;
+            m_axi_d_rready    <= 1'b0;
+            m_axi_d_awvalid   <= 1'b0;
+            m_axi_d_awaddr    <= '0;
+            m_axi_d_wvalid    <= 1'b0;
+            m_axi_d_bready    <= 1'b0;
         end else begin
             dmem_ack <= 1'b0;
 
             case (d_state)
 
                 IDLE: begin
-                    d_beat <= '0;
+                    d_beat   <= '0;
                     dmem_ack <= 1'b0;
                     if (dmem_req && !dmem_ack) begin
                         if (dmem_we) begin
-                            m_axi_d_awaddr  <= dmem_uncached
+                            m_axi_d_awaddr    <= dmem_uncached
                                 ? dmem_addr
                                 : {dmem_addr[PADDR_WIDTH-1:6], 6'b0};
-                            m_axi_d_awvalid <= 1'b1;
+                            m_axi_d_awvalid   <= 1'b1;
                             d_state           <= W_ADDR;
                             d_base            <= {dmem_addr[PADDR_WIDTH-1:6], 6'b0};
                             d_wbuf_reg        <= dmem_wdata;
@@ -184,19 +208,21 @@ module nebula_axi_adapter #(
                             d_target_beat_reg <= dmem_addr[5:3];
                             d_uncached_reg    <= dmem_uncached;
                         end else begin
-                            m_axi_d_araddr  <= dmem_uncached
+                            m_axi_d_araddr    <= dmem_uncached
                                 ? dmem_addr
                                 : {dmem_addr[PADDR_WIDTH-1:6], 6'b0};
-                            m_axi_d_arvalid <= 1'b1;
-                            d_uncached_reg  <= dmem_uncached;
+                            m_axi_d_arvalid   <= 1'b1;
+                            d_uncached_reg    <= dmem_uncached;
                             d_target_beat_reg <= dmem_addr[5:3];
-                            d_state         <= R_ADDR;
+                            d_state           <= R_ADDR;
                         end
                     end
                 end
 
                 // --- Canal de Leitura ---
                 R_ADDR: begin
+                    // BUG 1 FIX: mem_ready pulsa neste ciclo (arready=1).
+                    // A L2 detecta mem_ready=1 e avança S_FILL_REQ→S_FILL_WAIT.
                     if (m_axi_d_arready) begin
                         m_axi_d_arvalid <= 1'b0;
                         m_axi_d_rready  <= 1'b1;
@@ -220,7 +246,9 @@ module nebula_axi_adapter #(
                                 // Montar a linha de 512 bits.
                                 // d_beat neste ponto é o índice do ÚLTIMO beat (7).
                                 // Os beats 0..6 já estão em d_rbuf (registrados
-                                // em ciclos anteriores). O beat 7 é m_axi_d_rdata.
+                                // em ciclos anteriores via non-blocking).
+                                // O beat atual (d_beat) ainda não foi commitado
+                                // em d_rbuf — lido diretamente de m_axi_d_rdata.
                                 d_rdata_reg <= {
                                     (d_beat == 3'd7) ? m_axi_d_rdata : d_rbuf[7*64 +: 64],
                                     (d_beat == 3'd6) ? m_axi_d_rdata : d_rbuf[6*64 +: 64],
@@ -240,6 +268,7 @@ module nebula_axi_adapter #(
 
                 // --- Canal de Escrita ---
                 W_ADDR: begin
+                    // BUG 1 FIX: mem_ready pulsa neste ciclo (awready=1).
                     if (m_axi_d_awready) begin
                         m_axi_d_awvalid <= 1'b0;
                         m_axi_d_wvalid  <= 1'b1;
@@ -249,20 +278,17 @@ module nebula_axi_adapter #(
 
                 W_DATA: begin
                     if (m_axi_d_wready) begin
-                        // BUG 2 FIX: wlast é calculado combinacionalmente
-                        // como (d_beat == 7). Quando wready=1 e d_beat=7,
-                        // wlast=1 está sendo apresentado NESTE ciclo com
-                        // wdata=beat7. O incremento de d_beat (para 8)
-                        // acontece no always_ff APÓS este ciclo — o slave
-                        // já viu wlast=1 com o dado correto.
+                        // wlast é calculado combinacionalmente como (d_beat == 7).
+                        // Quando wready=1 e d_beat=7, wlast=1 está sendo apresentado
+                        // NESTE ciclo com wdata=beat7. O incremento de d_beat (para 8)
+                        // acontece no always_ff APÓS este ciclo — o slave já viu
+                        // wlast=1 com o dado correto.
                         if (m_axi_d_wlast) begin
-                            // Último beat aceito — aguardar B channel
                             m_axi_d_wvalid <= 1'b0;
                             m_axi_d_bready <= 1'b1;
                             d_beat         <= '0;
                             d_state        <= W_RESP;
                         end else begin
-                            // Avançar para o próximo beat
                             d_beat <= d_beat + 1;
                         end
                     end
@@ -343,7 +369,6 @@ module nebula_axi_adapter #(
                             imem_ack       <= 1'b1;
                             i_state        <= IDLE;
                             i_beat         <= '0;
-                            // Montar linha de 512 bits (mesmo padrão do canal D)
                             i_rdata_reg <= {
                                 (i_beat == 3'd7) ? m_axi_i_rdata : i_rbuf[7*64 +: 64],
                                 (i_beat == 3'd6) ? m_axi_i_rdata : i_rbuf[6*64 +: 64],
@@ -365,17 +390,18 @@ module nebula_axi_adapter #(
         end
     end
 
+    // =========================================================================
     // Debug para LiteX
+    // =========================================================================
     logic dbg_arvalid_ant;
     logic dbg_awvalid_ant;
     always_ff @(posedge clk) begin
         dbg_arvalid_ant <= m_axi_d_arvalid;
         dbg_awvalid_ant <= m_axi_d_awvalid;
-        
-        if (m_axi_d_arvalid && !dbg_arvalid_ant) begin
+
+        if (m_axi_d_arvalid && !dbg_arvalid_ant)
             $display("[NEBULA READ] Endereco: %h", m_axi_d_araddr);
-        end
-        
+
         if (m_axi_d_awvalid && !dbg_awvalid_ant) begin
             $display("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
             $display("[NEBULA WRITE] O CPU TENTOU ESCREVER EM: %h", m_axi_d_awaddr);
